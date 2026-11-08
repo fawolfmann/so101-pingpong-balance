@@ -1,0 +1,23 @@
+[project]
+name = "so101-pingpong-balance"
+version = "0.1.0"
+description = "SO-101 arm balances a ping-pong ball on a paddle, sensing the ball with only its wrist camera: PPO in MuJoCo, sim-to-real"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "zecice" }]
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium>=1.4.0",
+    "mujoco==3.17.0",  # trained and validated on 3.17; 4.x changes the physics slightly
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "psutil>=5.9",
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+hardware = ["lerobot[feetech]>=0.6.1,<0.7"]
+wandb = ["wandb>=0.20"]
+
+[project.urls]
+Repository = "https://github.com/zecice/so101-pingpong-balance"

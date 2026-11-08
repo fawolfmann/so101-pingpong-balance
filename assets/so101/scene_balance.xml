@@ -1,0 +1,34 @@
+<mujoco model="scene_balance">
+    <!-- SO-101 with a paddle on the gripper + a ping-pong ball. Robot base at the origin, arm along +x.
+         sim/env.py sets the timestep (1/480 s), moves the arm to its home pose and places the ball on the blade at every reset. -->
+    <include file="so101_new_calib_paddle.xml" />
+
+    <option timestep="0.002" cone="elliptic" impratio="10" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="160" elevation="-20" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+            rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
+
+        <!-- Ping-pong ball: 40 mm, 2.7 g, hollow shell (I = 2/3 m r^2 = 7.2e-7) -->
+        <body name="ball" pos="0.398 -0.002 0.290">
+            <freejoint name="ball_joint" />
+            <inertial pos="0 0 0" mass="0.0027" diaginertia="7.2e-7 7.2e-7 7.2e-7" />
+            <geom name="ball_geom" type="sphere" size="0.02" rgba="1 0.5 0.1 1" condim="4"
+                  friction="0.6 0.005 0.0001" solref="0.004 1" />
+            <site name="ball_center" pos="0 0 0" size="0.003" rgba="0 0 0 0" group="3" />
+        </body>
+    </worldbody>
+</mujoco>
