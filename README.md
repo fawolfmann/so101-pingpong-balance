@@ -39,7 +39,7 @@ uv sync                      # sim only
 uv sync --extra hardware     # + LeRobot / Feetech drivers for the real arm
 ```
 Uses [uv](https://docs.astral.sh/uv/); `uv sync` installs the exact tested versions from `uv.lock` (pip install is not set up).
-Run everything from the repo root. Developed on Linux (laptop, CPU only, 16 GB RAM); the code avoids Linux-only calls, but macOS and
+Run everything from the repo root. Developed on Linux (laptop with an RTX A1000, 16 GB RAM); the code avoids Linux-only calls, but macOS and
 Windows are untested. On macOS the live viewer must be started with `mjpython` instead of `python`.
 Training needs ~5 GB of free RAM by default; see the note under training if you have less.
 
@@ -52,7 +52,7 @@ uv run python -m perception.estimator --eval weights/estimator.pt --latency 0,2,
                                                                # full camera pipeline in sim
 ```
 
-### Train the controller (~29M steps, ~2 h on 6 CPU cores)
+### Train the controller (~29M steps, ~2 h: sim on 6 CPU cores, network on the GPU)
 
 Default: 6 workers x 4 envs = 24 parallel sims x 128 steps = 3072 samples per iteration.
 - Fewer CPU cores: keep the 24 envs on fewer workers (`--workers 3 --envs-per-worker 8`).
