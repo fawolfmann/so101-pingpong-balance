@@ -79,3 +79,13 @@ def test_invalid_kick_range_rejected():
         make(kick_min=0.3, kick_max=0.1)
     with pytest.raises(ValueError):
         make(kick_min=-0.1, kick_max=0.1)
+
+
+def test_smooth_penalty_scales_the_action_change_cost():
+    rewards = {}
+    for k in (0.0, 1.0):
+        env = BalanceEnv(obs_mode="controller", act_hist=3, smooth_penalty=k)
+        env.reset(seed=4)
+        env.step(np.full(5, 0.5))
+        rewards[k] = env.step(np.full(5, -0.5))[1]  # action change of 1.0 on 5 joints
+    assert rewards[0.0] - rewards[1.0] == pytest.approx(5.0, abs=0.05)

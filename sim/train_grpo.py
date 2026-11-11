@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--servo-rand", action="store_true")
     p.add_argument("--ball-noise", type=float, default=0.0)
     p.add_argument("--grip-rot", type=float, default=0.0)
+    p.add_argument("--smooth-penalty", type=float, default=0.01, help="reward -= this * sum((a - previous a)^2): discourages jitter")
     p.add_argument("--episode-s", type=float, default=10.0)
     p.add_argument("--kick-min", type=float, default=0.0)
     p.add_argument("--kick-max", type=float, default=0.0)
@@ -94,7 +95,8 @@ def main() -> None:
     env = EpisodicVecEnv(a.workers, a.envs_per_worker, domain_rand=not a.no_domain_rand, max_latency=a.max_latency,
                          act_hist=a.act_hist, grip_rot_deg=a.grip_rot, home_penalty=a.home_penalty, servo_rand=a.servo_rand,
                          ball_noise=a.ball_noise, max_steps=round(a.episode_s * CONTROL_HZ), kick_min=a.kick_min,
-                         kick_max=a.kick_max, kick_every=a.kick_every, kick_margin=a.kick_margin)
+                         kick_max=a.kick_max, kick_every=a.kick_every, kick_margin=a.kick_margin,
+                         smooth_penalty=a.smooth_penalty)
     G, P = a.group_size, env.n_envs // a.group_size
     ac = ActorCritic(env.obs_dim, env.act_dim)
     opt = torch.optim.Adam(list(ac.actor.parameters()) + [ac.log_std], lr=a.lr, eps=1e-5)

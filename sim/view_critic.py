@@ -28,10 +28,18 @@ AFTER_END_S = 1.0  # keep simulating this long after the episode ends
 LINES = [("critic value", (0.16, 0.47, 0.84)), ("ball dist (cm)", (0.92, 0.41, 0.20)), ("edge", (0.55, 0.55, 0.52))]
 
 
-def make_figure(y_lo: float, y_hi: float) -> mujoco.MjvFigure:
+def policy_label(path: str) -> str:
+    """Short name for a checkpoint: '<run>/<file>' plus its training steps when saved, e.g. 'ppo_kicks/best (2.0M steps)'."""
+    p = Path(path)
+    ck = torch.load(p, map_location="cpu", weights_only=True)
+    steps = f" ({ck['steps'] / 1e6:.1f}M steps)" if "steps" in ck else ""
+    return f"{p.parent.name}/{p.stem}{steps}"
+
+
+def make_figure(y_lo: float, y_hi: float, policy: str) -> mujoco.MjvFigure:
     fig = mujoco.MjvFigure()
     mujoco.mjv_defaultFigure(fig)
-    fig.title = "critic value vs ball distance"
+    fig.title = f"{policy}: critic value vs ball distance"
     fig.xlabel = "seconds"
     fig.flg_extend = 0
     fig.flg_legend = 1
@@ -72,7 +80,8 @@ def main() -> None:
     ac = load_controller(a.controller)
     env = make_env(ac, max_steps=round(a.seconds * CONTROL_HZ), light_model=False)  # full visual model: arm + paddle drawn
     edge_cm = (env.blade_radius - 0.5 * env.ball_radius) * 100
-    fig = make_figure(-2.0, 10.0)
+    policy = policy_label(a.controller)
+    fig = make_figure(-2.0, 10.0, policy)
     rng = np.random.default_rng(a.seed)
     seed, episodes, balanced, n_kicks = a.seed, 0, 0, 0
     last_kick = "none yet"
@@ -84,6 +93,8 @@ def main() -> None:
     # side panels hidden so the plot has the right side (Tab / Shift+Tab bring them back)
     with mujoco.viewer.launch_passive(env.m, env.d, show_left_ui=False, show_right_ui=False) as v:
         v.cam.lookat[:] = [0.41, 0.0, 0.30]; v.cam.distance = 0.9; v.cam.azimuth = 150; v.cam.elevation = -25
+        with v.lock():  # start from the default display: no inertia boxes or other debug overlays left on
+            mujoco.mjv_defaultOption(v.opt)
         while v.is_running():
             t0 = time.time()
             obs = env.controller_obs()
@@ -103,8 +114,8 @@ def main() -> None:
                 update_figure(fig, hist, edge_cm)
                 v.set_figures((mujoco.MjrRect(vp.left + vp.width - w, vp.bottom + (vp.height - h) // 2, w, h), fig))
             v.set_texts((mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                         "episode\nstatus\ntime\nlast kick\nnext kick\nbalanced",
-                         f"{episodes + 1} (latency {env._action_delay})\n{status}\n{env.t / CONTROL_HZ:.1f} / {a.seconds:g} s\n"
+                         "policy\nepisode\nstatus\ntime\nlast kick\nnext kick\nbalanced",
+                         f"{policy}\n{episodes + 1} (latency {env._action_delay})\n{status}\n{env.t / CONTROL_HZ:.1f} / {a.seconds:g} s\n"
                          f"{last_kick}\n{kicks[n_kicks % len(kicks)]:g} m/s\n{balanced}/{episodes}"))
             v.sync()
 

@@ -35,3 +35,11 @@ def test_alarm_table_catches_drop_without_false_alarms():
     row = next(r for r in alarm_table(ok, drops) if r["pct"] == 1)
     assert row["caught"] == 1.0 and row["false_alarm"] == 0.0
     assert row["lead_s"] == 10 / 30
+
+
+def test_action_jitter():
+    from sim.stress import action_jitter
+
+    assert action_jitter(np.zeros((10, 5))) == 0.0
+    assert action_jitter(np.tile([[1.0] * 5, [-1.0] * 5], (5, 1))) == 2.0  # full reversal every step
+    assert action_jitter(np.zeros((1, 5))) == 0.0

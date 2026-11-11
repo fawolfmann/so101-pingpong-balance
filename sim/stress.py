@@ -24,6 +24,13 @@ def make_env(ac, max_steps: int = 300, light_model: bool | None = None) -> Balan
                       light_model=light_model)
 
 
+def action_jitter(actions: np.ndarray) -> float:
+    """Mean absolute change of the action per step, over all joints (actions in [-1, 1]). The original controller is
+    ~0.03; a visibly shaking policy is ~0.3+."""
+    a = np.asarray(actions, np.float64)
+    return float(np.abs(np.diff(a, axis=0)).mean()) if len(a) > 1 else 0.0
+
+
 def warning_lead(values: np.ndarray, threshold: float) -> int:
     """Steps of the final run of values below `threshold` (0 if the last value is not below it).
     For an episode that ends in a drop, this is how many steps ahead the critic warned."""
@@ -43,19 +50,22 @@ def run_episode(env: BalanceEnv, ac, seed: int, seconds: float, kick_speed: floa
     env.kick_speed, env.kick_every, env.kick_grace, env.kick_margin = (kick_speed, kick_speed), kick_every, 1.0, 0.0
     env.reset(seed=seed)
     kicks = sorted(env.kicks)
-    values, dists = [], []
+    values, dists, actions = [], [], []
     info: dict = {}
     for t in range(env.max_steps):
         obs = env.controller_obs()
         if record:
             values.append(float(ac.value(torch.as_tensor(obs[None]))[0]))
-        _, _, terminated, truncated, info = env.step(controller_action(ac, obs))
+        action = controller_action(ac, obs)
+        actions.append(action)
+        _, _, terminated, truncated, info = env.step(action)
         if record:
             dists.append(info["dist"] * 1000)
         if terminated or truncated:
             break
     ep = dict(seed=seed, seconds=seconds, kick_speed=kick_speed, success=bool(info["is_success"]),
-              dropped=bool(info.get("fell") or info.get("bad_qacc")), length=t + 1, dist_mm=float(info["dist"] * 1000))
+              dropped=bool(info.get("fell") or info.get("bad_qacc")), length=t + 1, dist_mm=float(info["dist"] * 1000),
+              jitter=action_jitter(np.array(actions)))
     if record:
         ep.update(value=values, dist_trace=dists, kicks=kicks)
     return ep

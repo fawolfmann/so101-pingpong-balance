@@ -93,6 +93,7 @@ class BalanceEnv(gym.Env):
         grip_rot_deg: float = 0.0,  # paddle rotation about the tool axis (real grip: -90, blade edge-on to the camera)
         max_latency: int = 2,  # randomized control latency: 0..max_latency extra steps
         home_penalty: float = 0.0,  # reward -= home_penalty * sum(((q - home) / 20 deg)^2)
+        smooth_penalty: float = 0.01,  # reward -= smooth_penalty * sum((a - previous a)^2): discourages jittery actions
         servo_rand: bool = False,  # randomize servo stiffness, damping and force limit
         cam_rand: float = 1.0,  # scale of the camera pose/FOV randomization
         ball_noise: float = 0.0,  # >0: controller sees estimator-like noisy positions + FdVel velocity (1 = measured error)
@@ -112,6 +113,7 @@ class BalanceEnv(gym.Env):
         self.ball_start_radius, self.ball_start_speed, self.success_radius = ball_start_radius, ball_start_speed, success_radius
         self.max_latency, self.act_hist = max_latency, act_hist
         self.home_penalty, self.servo_rand, self.ball_noise, self.cam_rand = home_penalty, servo_rand, ball_noise, cam_rand
+        self.smooth_penalty = smooth_penalty
         self._fd = FdVel()
         self._ball_obs = np.zeros(4)
         self._hist = np.zeros((act_hist, 5))
@@ -339,7 +341,7 @@ class BalanceEnv(gym.Env):
         u, w, h, speed = self.ball_in_blade()
         dist = float(np.hypot(u, w))
         # reward (true ball state): near the centre, slow ball, smooth actions
-        reward = (1.0 - min(dist / self.blade_radius, 1.0)) - 0.05 * speed - 0.01 * float(np.sum((a - self._prev_action) ** 2))
+        reward = (1.0 - min(dist / self.blade_radius, 1.0)) - 0.05 * speed - self.smooth_penalty * float(np.sum((a - self._prev_action) ** 2))
         if self.home_penalty:
             reward -= self.home_penalty * float(np.sum(((self.d.qpos[self.q_adr] - self.home_q) / 0.349) ** 2))
         if self.ball_noise:
