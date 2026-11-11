@@ -84,3 +84,90 @@ class VecBalanceEnv:
                 pass
         for p in self.procs:
             p.join(timeout=5)
+
+
+def _episodic_worker(conn, env_kwargs, n_envs):
+    """Like _worker, but resets with given seeds and never auto-resets: a finished env returns its last obs, reward 0
+    and done=True until the next reset."""
+    from sim.env import BalanceEnv
+
+    envs = [BalanceEnv(obs_mode="controller", **env_kwargs) for _ in range(n_envs)]
+    done = np.zeros(n_envs, bool)
+    res: list[dict] = [{} for _ in envs]
+    last = [None] * n_envs
+    while True:
+        cmd, data = conn.recv()
+        if cmd == "reset":
+            obs, kicks = [], []
+            for i, (e, s) in enumerate(zip(envs, data)):
+                o, _ = e.reset(seed=int(s))
+                obs.append(o); last[i] = o
+                kicks.append(tuple((t, round(float(v[0]), 9), round(float(v[1]), 9)) for t, v in sorted(e.kicks.items())))
+                res[i] = dict(seed=int(s), ret=0.0, length=0, success=False, latency=e._action_delay)
+            done[:] = False
+            conn.send((np.stack(obs), kicks))
+        elif cmd == "step":
+            obs, rew = [], []
+            for i, (e, a) in enumerate(zip(envs, data)):
+                if done[i]:
+                    obs.append(last[i]); rew.append(0.0)
+                    continue
+                o, r, te, tr, info = e.step(a)
+                res[i]["ret"] += r; res[i]["length"] += 1
+                if te or tr:
+                    done[i] = True
+                    res[i].update(success=bool(info["is_success"]), dropped=bool(info["fell"] or info["bad_qacc"]))
+                obs.append(o); rew.append(r); last[i] = o
+            conn.send((np.stack(obs), np.array(rew, np.float32), done.copy()))
+        elif cmd == "results":
+            conn.send([dict(r) for r in res])
+        elif cmd == "close":
+            conn.close()
+            return
+
+
+class EpisodicVecEnv:
+    """Parallel BalanceEnvs for GRPO: reset(seeds) starts one episode per env from the given seeds (envs sharing a seed
+    share the start state, randomization and kicks); step() runs them until every episode has ended (no auto-reset)."""
+
+    def __init__(self, n_workers: int = 6, envs_per_worker: int = 8, **env_kwargs):
+        check_ram(1.5 * 135 * n_workers * envs_per_worker, "Use fewer envs (--workers / --envs-per-worker).")
+        ctx = mp.get_context("spawn")
+        self.n_envs, self.per = n_workers * envs_per_worker, envs_per_worker
+        self.conns, self.procs = [], []
+        for _ in range(n_workers):
+            parent, child = ctx.Pipe()
+            p = ctx.Process(target=_episodic_worker, args=(child, env_kwargs, envs_per_worker), daemon=True)
+            p.start(); child.close()
+            self.conns.append(parent); self.procs.append(p)
+        self.obs_dim, self.act_dim = 14 + 5 * env_kwargs.get("act_hist", 1), 5
+
+    def _chunks(self, x):
+        return [x[i * self.per:(i + 1) * self.per] for i in range(len(self.conns))]
+
+    def reset(self, seeds) -> tuple[np.ndarray, list[tuple]]:
+        """Returns (obs, kicks): kicks[i] = env i's kick schedule as ((step, vx, vy), ...)."""
+        seeds = list(seeds)
+        if len(seeds) != self.n_envs:
+            raise ValueError(f"need {self.n_envs} seeds, got {len(seeds)}")
+        for c, s in zip(self.conns, self._chunks(seeds)):
+            c.send(("reset", s))
+        out = [c.recv() for c in self.conns]
+        return np.concatenate([o[0] for o in out]), [k for o in out for k in o[1]]
+
+    def step(self, actions) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns (obs, reward, done); done stays True for an env once its episode has ended."""
+        actions = np.asarray(actions, np.float32).reshape(self.n_envs, self.act_dim)
+        for c, a in zip(self.conns, self._chunks(actions)):
+            c.send(("step", a))
+        out = [c.recv() for c in self.conns]
+        return tuple(np.concatenate([o[k] for o in out]) for k in range(3))
+
+    def results(self) -> list[dict]:
+        """Per env: seed, return, length, success, dropped, latency of the current episode."""
+        for c in self.conns:
+            c.send(("results", None))
+        return [r for c in self.conns for r in c.recv()]
+
+    def close(self):
+        VecBalanceEnv.close(self)

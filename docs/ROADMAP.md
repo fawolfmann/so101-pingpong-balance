@@ -42,6 +42,22 @@ seed get identical kicks, which is what GRPO groups need. The policy is not told
 A kick sets the ball sliding without spin; friction turns that into rolling within one step, so a hollow ping-pong ball
 (I = ⅔mr²) ends up moving at ⅗ of the kick speed.
 
+### GRPO training
+
+`sim/grpo.py` (advantages + clipped update) and `sim/train_grpo.py` (loop), with `EpisodicVecEnv` in `sim/vec_env.py`
+(reset with given seeds, no auto-reset). Each iteration: P seeds x G episodes, run to the end; advantage per episode =
+(return - group mean) / group std, applied to every step. Same network class as PPO (critic never trained), same env
+flags as `train_controller.py`, so checkpoints work with every eval tool. Comparison run, same conditions as PPO:
+
+```bash
+# PPO baseline with kicks
+uv run python -m sim.train_controller --name ppo_kicks --iters 9500 --act-hist 3 --grip-rot -90 --max-latency 4 \
+    --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
+# GRPO, same conditions and step budget
+uv run python -m sim.train_grpo --name grpo_kicks --total-steps 29.2e6 --act-hist 3 --grip-rot -90 --max-latency 4 \
+    --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
+```
+
 ## How the pieces fit (what each change touches)
 
 ```
