@@ -36,10 +36,10 @@ def policy_label(path: str) -> str:
     return f"{p.parent.name}/{p.stem}{steps}"
 
 
-def make_figure(y_lo: float, y_hi: float, policy: str) -> mujoco.MjvFigure:
+def make_figure(y_lo: float, y_hi: float, policy: str, has_critic: bool = True) -> mujoco.MjvFigure:
     fig = mujoco.MjvFigure()
     mujoco.mjv_defaultFigure(fig)
-    fig.title = f"{policy}: critic value vs ball distance"
+    fig.title = f"{policy}: critic value vs ball distance" if has_critic else f"{policy}: ball distance (GRPO, no critic)"
     fig.xlabel = "seconds"
     fig.flg_extend = 0
     fig.flg_legend = 1
@@ -48,13 +48,13 @@ def make_figure(y_lo: float, y_hi: float, policy: str) -> mujoco.MjvFigure:
     fig.gridsize = [6, 7]
     fig.figurergba[3] = 0.6
     for i, (name, rgb) in enumerate(LINES):
-        fig.linename[i] = name
+        fig.linename[i] = name if (has_critic or i) else ""
         fig.linergb[i] = rgb
     fig.linewidth = 2.0
     return fig
 
 
-def update_figure(fig: mujoco.MjvFigure, hist: list[tuple[float, float, float]], edge_cm: float) -> None:
+def update_figure(fig: mujoco.MjvFigure, hist: list[tuple[float, float, float]], edge_cm: float, has_critic: bool = True) -> None:
     """hist: (time s, value, dist cm), newest last; plots the last WINDOW_S seconds against time-from-now."""
     if not hist:
         return
@@ -62,7 +62,7 @@ def update_figure(fig: mujoco.MjvFigure, hist: list[tuple[float, float, float]],
     pts = [h for h in hist if h[0] >= now - WINDOW_S][-mujoco.mjMAXLINEPNT:]
     xs = np.array([p[0] - now for p in pts])
     for i, ys in enumerate([np.array([p[1] for p in pts]), np.array([p[2] for p in pts]), np.full(len(pts), edge_cm)]):
-        fig.linepnt[i] = len(pts)
+        fig.linepnt[i] = len(pts) if (has_critic or i) else 0  # GRPO: its critic is untrained, don't plot it
         fig.linedata[i, 0:2 * len(pts):2] = xs
         fig.linedata[i, 1:2 * len(pts):2] = ys
 
@@ -81,7 +81,8 @@ def main() -> None:
     env = make_env(ac, max_steps=round(a.seconds * CONTROL_HZ), light_model=False)  # full visual model: arm + paddle drawn
     edge_cm = (env.blade_radius - 0.5 * env.ball_radius) * 100
     policy = policy_label(a.controller)
-    fig = make_figure(-2.0, 10.0, policy)
+    has_critic = "group_size" not in ac.train_args  # GRPO checkpoints never train the critic
+    fig = make_figure(-2.0 if has_critic else 0.0, 10.0, policy, has_critic)
     rng = np.random.default_rng(a.seed)
     seed, episodes, balanced, n_kicks = a.seed, 0, 0, 0
     last_kick = "none yet"
@@ -111,7 +112,7 @@ def main() -> None:
             vp = v.viewport
             if vp is not None:
                 w, h = int(vp.width * 0.34), int(vp.height * 0.5)  # right side, vertically centred
-                update_figure(fig, hist, edge_cm)
+                update_figure(fig, hist, edge_cm, has_critic)
                 v.set_figures((mujoco.MjrRect(vp.left + vp.width - w, vp.bottom + (vp.height - h) // 2, w, h), fig))
             v.set_texts((mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT,
                          "policy\nepisode\nstatus\ntime\nlast kick\nnext kick\nbalanced",

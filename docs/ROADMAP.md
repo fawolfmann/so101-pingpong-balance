@@ -82,6 +82,25 @@ uv run python -m sim.train_grpo --name grpo_kicks --total-steps 6.45e6 --smooth-
     --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
 ```
 
+### GRPO vs PPO: results
+
+Same conditions (4 s episodes, one 0–0.3 m/s kick, smooth penalty 0.3), G = 8 episodes per seed, 6 seeds per iteration.
+
+| training success | 0.25M | 0.5M | 1M | 2.15M | 4M | 6.4M |
+|---|---|---|---|---|---|---|
+| PPO | 82% | 93% | 94% | 96% (end) | — | — |
+| GRPO | 26% | 93% | 85% | 79% | 94% | 97% |
+
+| stress eval, 10 s (30 s) | no kick | 0.2 m/s | 0.3 m/s | 0.4 m/s | jitter | time |
+|---|---|---|---|---|---|---|
+| PPO, 2.15M steps | 100% (100%) | 95% (85%) | 70% (38%) | 25% (2%) | 0.032 | 6 min |
+| GRPO, 6.45M steps | 98% (95%) | 90% (80%) | 75% (60%) | 40% (10%) | 0.044 | 12 min |
+
+- GRPO starts slower and is noisier (one score per episode vs PPO's per-step critic), but kept improving and ends
+  better on strong kicks: all G attempts face the identical kick, so the comparison isolates the reaction to it.
+- Every group had a learning signal (0% groups with identical returns).
+- Open: PPO with the same 6.45M budget, and 2–3 training seeds per algorithm, to separate algorithm from budget and luck.
+
 ## How the pieces fit (what each change touches)
 
 ```
