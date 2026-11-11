@@ -27,9 +27,79 @@ Each step changes one thing, so when a result is worse you know why.
 
 Baseline (pretrained PPO controller, MuJoCo 4.0):
 - No kicks: 100% at 10, 20 and 30 s, so episode length alone is not a problem.
-- Breaking point at 0.15–0.2 m/s kicks: 80% → 48% success at 10 s. At 0.25 m/s, 0% beyond 10 s. It was never trained with kicks.
+- Breaking point at 0.15–0.2 m/s kicks: ~80% → ~50% success at 10 s. At 0.25 m/s, 0–5% beyond 10 s.
+  It was never kicked in training: the only ball motion was a start velocity of at most 0.03 m/s per axis.
 - The critic is a weak drop predictor: its value falls only ~0.2–0.5 s before a drop, and balanced episodes dip just as
   low right after a kick (at the 1st-percentile threshold: catches 18% of drops, 56% false alarms).
+
+### Kicks in training
+
+`BalanceEnv` can kick the ball mid-episode (`kick_min`/`kick_max` m/s, one per `kick_every` s, none in the first
+`kick_grace` s or the last `kick_margin` s). The schedule comes from the reset seed only, so episodes reset with the same
+seed get identical kicks, which is what GRPO groups need. The policy is not told about kicks. Training flags:
+`--episode-s`, `--kick-min`, `--kick-max`, `--kick-every`, `--kick-margin`. The stress tools use the same code.
+
+A kick sets the ball sliding without spin; friction turns that into rolling within one step, so a hollow ping-pong ball
+(I = ⅔mr²) ends up moving at ⅗ of the kick speed.
+
+### PPO with kicks: results
+
+PPO from scratch, 4 s episodes, one kick of 0–0.3 m/s, otherwise the README settings. Stress eval at 10 s
+(jitter = mean |a_t − a_t−1|; the original controller is ~0.03, visible shaking ~0.3):
+
+| smooth penalty | steps | jitter | no kick | 0.2 m/s | 0.3 m/s | 0.4 m/s |
+|---|---|---|---|---|---|---|
+| original controller | 28.7M | ~0.03 | 100% | 52% | 0% | 0% |
+| 0.01 (old default) | 2.0M (best) | 0.19 | 100% | 95% | 65% | 25% |
+| 0.01 | 6.3M (last) | 0.09 | 92% | 90% | 55% | 2% |
+| 0.1 | 2.15M | 0.05 | 100% | 90% | 65% | 22% |
+| **0.3** | **2.15M** | **0.03** | **100%** | **95%** | **70%** | **25%** |
+| 1.0 | 2.15M | 0.02 | 100% | 85% | 50% | 15% |
+
+Lessons:
+- Kick training moves the breaking point from ~0.2 to ~0.3 m/s in ~2M steps, and it holds on 30 s episodes.
+- With the old 0.01 smoothness penalty the policy learned a visible tremor: shaking was almost free in the reward, and
+  soft servos hid it in most training episodes. It only shows with stiff servos and low latency.
+- 0.3 removes the tremor at no cost in robustness; 1.0 is too sluggish for strong kicks.
+- Training success (~95% throughout) hid both the tremor and the 6.3M checkpoint's regression: always run the stress eval.
+- Set `--iters` to the real run length so the learning rate decays over it.
+
+Chosen PPO baseline: penalty 0.3, 2.15M steps (kept locally, not in git: `outputs/weights/ppo_kicks_smooth.pt`).
+
+### GRPO training
+
+`sim/grpo.py` (advantages + clipped update) and `sim/train_grpo.py` (loop), with `EpisodicVecEnv` in `sim/vec_env.py`
+(reset with given seeds, no auto-reset). Each iteration: P seeds x G episodes, run to the end; advantage per episode =
+(return - group mean) / group std, applied to every step. Same network class as PPO (critic never trained), same env
+flags as `train_controller.py`, so checkpoints work with every eval tool. Comparison run, same conditions as PPO:
+
+```bash
+# PPO baseline with kicks
+uv run python -m sim.train_controller --name ppo_kicks --iters 700 --smooth-penalty 0.3 --act-hist 3 --grip-rot -90 --max-latency 4 \
+    --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
+# GRPO, same conditions and step budget
+uv run python -m sim.train_grpo --name grpo_kicks --total-steps 6.45e6 --smooth-penalty 0.3 --act-hist 3 --grip-rot -90 --max-latency 4 \
+    --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
+```
+
+### GRPO vs PPO: results
+
+Same conditions (4 s episodes, one 0–0.3 m/s kick, smooth penalty 0.3), G = 8 episodes per seed, 6 seeds per iteration.
+
+| training success | 0.25M | 0.5M | 1M | 2.15M | 4M | 6.4M |
+|---|---|---|---|---|---|---|
+| PPO | 82% | 93% | 94% | 96% (end) | — | — |
+| GRPO | 26% | 93% | 85% | 79% | 94% | 97% |
+
+| stress eval, 10 s (30 s) | no kick | 0.2 m/s | 0.3 m/s | 0.4 m/s | jitter | time |
+|---|---|---|---|---|---|---|
+| PPO, 2.15M steps | 100% (100%) | 95% (85%) | 70% (38%) | 25% (2%) | 0.032 | 6 min |
+| GRPO, 6.45M steps | 98% (95%) | 90% (80%) | 75% (60%) | 40% (10%) | 0.044 | 12 min |
+
+- GRPO starts slower and is noisier (one score per episode vs PPO's per-step critic), but kept improving and ends
+  better on strong kicks: all G attempts face the identical kick, so the comparison isolates the reaction to it.
+- Every group had a learning signal (0% groups with identical returns).
+- Open: PPO with the same 6.45M budget, and 2–3 training seeds per algorithm, to separate algorithm from budget and luck.
 
 ## How the pieces fit (what each change touches)
 

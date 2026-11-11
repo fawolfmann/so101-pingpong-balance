@@ -1,21 +1,8 @@
 import numpy as np
 import pytest
 
-from sim.stress import kick_schedule, warning_lead, run_episode, make_env
+from sim.stress import warning_lead, run_episode, make_env
 from sim.policies import load_controller
-
-
-def test_kick_schedule_one_kick_per_window_after_grace():
-    rng = np.random.default_rng(0)
-    kicks = kick_schedule(rng, n_steps=600, every_s=4.0, grace_s=1.0)
-    steps = sorted(kicks)
-    assert len(steps) == 5  # windows [30,150) [150,270) ... [510,600): 600 steps = 20 s
-    assert all(30 <= t < 600 for t in steps)
-    assert all(0 <= a < 2 * np.pi for a in kicks.values())
-
-
-def test_kick_schedule_disabled():
-    assert kick_schedule(np.random.default_rng(0), 300, every_s=0.0) == {}
 
 
 def test_warning_lead_counts_final_run_below_threshold():
@@ -48,3 +35,11 @@ def test_alarm_table_catches_drop_without_false_alarms():
     row = next(r for r in alarm_table(ok, drops) if r["pct"] == 1)
     assert row["caught"] == 1.0 and row["false_alarm"] == 0.0
     assert row["lead_s"] == 10 / 30
+
+
+def test_action_jitter():
+    from sim.stress import action_jitter
+
+    assert action_jitter(np.zeros((10, 5))) == 0.0
+    assert action_jitter(np.tile([[1.0] * 5, [-1.0] * 5], (5, 1))) == 2.0  # full reversal every step
+    assert action_jitter(np.zeros((1, 5))) == 0.0

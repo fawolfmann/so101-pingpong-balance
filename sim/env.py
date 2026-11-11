@@ -6,6 +6,11 @@ obs_mode:
                   [4:9] joint angles - home, / 0.2 rad    [9:14] joint velocities * 0.1    [14:] last act_hist actions, newest first
     "image"       {"image": wrist camera (96x128 RGB)}
 Action: 5 joint-angle deltas in [-1, 1] (x action_scale rad), 30 Hz. The gripper stays closed on the paddle.
+
+Kicks (off by default, kick_max > 0): mid-episode pushes that add a sideways velocity to the ball, one at a random step
+in each kick_every-second window between kick_grace s after the start and kick_margin s before the end, speed uniform in
+[kick_min, kick_max] m/s, random direction. The schedule (self.kicks) is fixed at reset and comes from the reset seed
+alone, so episodes reset with the same seed get the same kicks whatever the policy does. The policy is not told.
 """
 from __future__ import annotations
 
@@ -33,6 +38,24 @@ BN_OU = np.array([0.15, 0.5]) / 8
 BN_WHITE = np.array([0.03, 0.06]) / 8
 BN_A = float(np.exp(-1 / 60))
 FD_ALPHA = 0.5
+CONTROL_HZ = 30
+KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
+
+
+def kick_schedule(rng: np.random.Generator, n_steps: int, every_s: float, grace_s: float, margin_s: float,
+                  speed: tuple[float, float]) -> dict[int, np.ndarray]:
+    """{step: (vx, vy) m/s}: one kick at a random step in each every_s window inside [grace_s, end - margin_s)."""
+    lo_speed, hi_speed = speed
+    if every_s <= 0 or hi_speed <= 0:
+        return {}
+    start, stop = round(grace_s * CONTROL_HZ), n_steps - round(margin_s * CONTROL_HZ)
+    window = max(1, round(every_s * CONTROL_HZ))
+    kicks = {}
+    for lo in range(start, stop, window):
+        t = int(rng.integers(lo, min(lo + window, stop)))
+        ang, v = rng.uniform(0, 2 * np.pi), rng.uniform(lo_speed, hi_speed)
+        kicks[t] = v * np.array([np.cos(ang), np.sin(ang)])
+    return kicks
 
 
 class FdVel:
@@ -70,22 +93,33 @@ class BalanceEnv(gym.Env):
         grip_rot_deg: float = 0.0,  # paddle rotation about the tool axis (real grip: -90, blade edge-on to the camera)
         max_latency: int = 2,  # randomized control latency: 0..max_latency extra steps
         home_penalty: float = 0.0,  # reward -= home_penalty * sum(((q - home) / 20 deg)^2)
+        smooth_penalty: float = 0.01,  # reward -= smooth_penalty * sum((a - previous a)^2): discourages jittery actions
         servo_rand: bool = False,  # randomize servo stiffness, damping and force limit
         cam_rand: float = 1.0,  # scale of the camera pose/FOV randomization
         ball_noise: float = 0.0,  # >0: controller sees estimator-like noisy positions + FdVel velocity (1 = measured error)
         act_hist: int = 1,  # past actions in the controller obs (covers commands still in flight under latency)
+        kick_min: float = 0.0,  # m/s, kick speed range (see module docstring); kick_max = 0: no kicks
+        kick_max: float = 0.0,
+        kick_every: float = 4.0,  # s, one kick per window of this length
+        kick_grace: float = 1.0,  # s, no kick before this
+        kick_margin: float = 1.0,  # s, no kick in the last this-many seconds (time to recover before the success check)
         seed: int | None = None,
     ):
+        if not 0.0 <= kick_min <= kick_max:
+            raise ValueError(f"need 0 <= kick_min <= kick_max, got {kick_min}, {kick_max}")
         assert obs_mode in ("image", "controller")
         self.obs_mode, self.image_hw = obs_mode, image_hw
         self.max_steps, self.action_scale, self.domain_rand = max_steps, action_scale, domain_rand
         self.ball_start_radius, self.ball_start_speed, self.success_radius = ball_start_radius, ball_start_speed, success_radius
         self.max_latency, self.act_hist = max_latency, act_hist
         self.home_penalty, self.servo_rand, self.ball_noise, self.cam_rand = home_penalty, servo_rand, ball_noise, cam_rand
+        self.smooth_penalty = smooth_penalty
         self._fd = FdVel()
         self._ball_obs = np.zeros(4)
         self._hist = np.zeros((act_hist, 5))
         self.rng = np.random.default_rng(seed)
+        self.kick_speed, self.kick_every, self.kick_grace, self.kick_margin = (kick_min, kick_max), kick_every, kick_grace, kick_margin
+        self.kicks: dict[int, np.ndarray] = {}
 
         self.grip_rot_deg = grip_rot_deg
         # wrist roll compensates the grip rotation, so the blade has the same world pose
@@ -277,6 +311,7 @@ class BalanceEnv(gym.Env):
         self.t, self._prev_action = 0, np.zeros(5)
         self._hist = np.zeros((self.act_hist, 5))
         self._delay_buf = [np.zeros(5)] * self._action_delay
+        self.kicks = self._draw_kicks(seed)
         if self.ball_noise:
             k = r.uniform(0.5, 1.5) * self.ball_noise
             self._bn = dict(k=k, bias=r.normal(0, 1, 2) * BN_BIAS * k, ou=r.normal(0, 1, 2) * BN_OU * k, gain=1 + r.uniform(-0.1, 0.1, 2) * k)
@@ -284,7 +319,16 @@ class BalanceEnv(gym.Env):
             self._noisy_ball()
         return self._obs(), self._info()
 
+    def _draw_kicks(self, seed: int | None) -> dict[int, np.ndarray]:
+        if self.kick_speed[1] <= 0:
+            return {}  # kicks off: draw nothing, so the main rng sequence is unchanged
+        kseed = [seed, KICK_SEED_SALT] if seed is not None else [int(self.rng.integers(2**32)), KICK_SEED_SALT]
+        return kick_schedule(np.random.default_rng(kseed), self.max_steps, self.kick_every, self.kick_grace,
+                             self.kick_margin, self.kick_speed)
+
     def step(self, action):
+        if self.t in self.kicks:
+            self.d.qvel[self.ball_vadr:self.ball_vadr + 2] += self.kicks[self.t]
         a = np.clip(np.asarray(action, np.float64), -1, 1)
         self._delay_buf.append(a)
         a_applied = self._delay_buf.pop(0)
@@ -297,7 +341,7 @@ class BalanceEnv(gym.Env):
         u, w, h, speed = self.ball_in_blade()
         dist = float(np.hypot(u, w))
         # reward (true ball state): near the centre, slow ball, smooth actions
-        reward = (1.0 - min(dist / self.blade_radius, 1.0)) - 0.05 * speed - 0.01 * float(np.sum((a - self._prev_action) ** 2))
+        reward = (1.0 - min(dist / self.blade_radius, 1.0)) - 0.05 * speed - self.smooth_penalty * float(np.sum((a - self._prev_action) ** 2))
         if self.home_penalty:
             reward -= self.home_penalty * float(np.sum(((self.d.qpos[self.q_adr] - self.home_q) / 0.349) ** 2))
         if self.ball_noise:

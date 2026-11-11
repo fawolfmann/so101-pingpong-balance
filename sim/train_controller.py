@@ -48,6 +48,12 @@ def main():
     p.add_argument("--servo-rand", action="store_true", help="randomize servo stiffness, damping and force limit per episode")
     p.add_argument("--ball-noise", type=float, default=0.0, help="estimator-like error on the ball obs, scale U(0.5, 1.5) x this per episode (1 = as measured)")
     p.add_argument("--grip-rot", type=float, default=0.0, help="paddle grip angle (real grip: -90 = blade seen edge-on by the wrist camera)")
+    p.add_argument("--smooth-penalty", type=float, default=0.01, help="reward -= this * sum((a - previous a)^2): discourages jitter")
+    p.add_argument("--episode-s", type=float, default=10.0, help="episode length in seconds (30 control steps each)")
+    p.add_argument("--kick-min", type=float, default=0.0, help="ball kick speed range, m/s (see sim/env.py); --kick-max 0 = no kicks")
+    p.add_argument("--kick-max", type=float, default=0.0)
+    p.add_argument("--kick-every", type=float, default=4.0, help="one kick per this many seconds")
+    p.add_argument("--kick-margin", type=float, default=1.0, help="no kicks in the last this-many seconds (time to recover)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-entity", default=None, help="wandb username or team (needed if the account has no default entity)")
@@ -55,6 +61,10 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true", help="continue from <name>/last.pt (same --name); keeps the saved hyperparameters")
     a = p.parse_args()
+    if not 0.0 <= a.kick_min <= a.kick_max:
+        p.error("need 0 <= --kick-min <= --kick-max")
+    if a.episode_s <= 0:
+        p.error("--episode-s must be > 0")
 
     torch.manual_seed(a.seed)
     torch.set_num_threads(2)  # the CPU cores belong to the simulators
@@ -79,7 +89,10 @@ def main():
 
     env = VecBalanceEnv(a.workers, a.envs_per_worker, seed=a.seed * 1000 + start_it * 50, domain_rand=not a.no_domain_rand,
                         max_latency=a.max_latency, act_hist=a.act_hist, grip_rot_deg=a.grip_rot,
-                        home_penalty=a.home_penalty, servo_rand=a.servo_rand, ball_noise=a.ball_noise)
+                        home_penalty=a.home_penalty, servo_rand=a.servo_rand, ball_noise=a.ball_noise,
+                        max_steps=round(getattr(a, "episode_s", 10.0) * 30), kick_min=getattr(a, "kick_min", 0.0),
+                        kick_max=getattr(a, "kick_max", 0.0), kick_every=getattr(a, "kick_every", 4.0),
+                        kick_margin=getattr(a, "kick_margin", 1.0), smooth_penalty=getattr(a, "smooth_penalty", 0.01))  # getattr: --resume of runs saved before these flags
     N, T = env.n_envs, a.steps
     ac = ActorCritic(env.obs_dim, env.act_dim).to(dev)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr, eps=1e-5)
