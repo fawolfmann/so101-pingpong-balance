@@ -83,6 +83,7 @@ class BalanceEnv(gym.Env):
         self,
         obs_mode: str = "controller",
         image_hw: tuple[int, int] = (96, 128),
+        camera: str = "wrist",  # model camera rendered in image mode: "wrist" (on the gripper) or "ego" (post on the base)
         max_steps: int = 300,  # 10 s
         action_scale: float = 0.04,  # rad per step at |a| = 1
         domain_rand: bool = False,
@@ -138,7 +139,7 @@ class BalanceEnv(gym.Env):
         self.ball_body, self.ball_geom = m.body("ball").id, m.geom("ball_geom").id
         self.blade_geom, self.grip_body = m.geom("paddle_blade").id, m.body("gripper").id
         self.floor_geom = m.geom("floor").id
-        self.cam_id = m.camera("wrist").id
+        self.cam_id = m.camera(camera).id
         self.blade_radius = float(m.geom_size[self.blade_geom][0])
         self.ball_radius = float(m.geom_size[self.ball_geom][0])
         jids = [m.joint(j).id for j in ARM_JOINTS]
