@@ -42,6 +42,30 @@ seed get identical kicks, which is what GRPO groups need. The policy is not told
 A kick sets the ball sliding without spin; friction turns that into rolling within one step, so a hollow ping-pong ball
 (I = ⅔mr²) ends up moving at ⅗ of the kick speed.
 
+### PPO with kicks: results
+
+PPO from scratch, 4 s episodes, one kick of 0–0.3 m/s, otherwise the README settings. Stress eval at 10 s
+(jitter = mean |a_t − a_t−1|; the original controller is ~0.03, visible shaking ~0.3):
+
+| smooth penalty | steps | jitter | no kick | 0.2 m/s | 0.3 m/s | 0.4 m/s |
+|---|---|---|---|---|---|---|
+| original controller | 28.7M | ~0.03 | 100% | 52% | 0% | 0% |
+| 0.01 (old default) | 2.0M (best) | 0.19 | 100% | 95% | 65% | 25% |
+| 0.01 | 6.3M (last) | 0.09 | 92% | 90% | 55% | 2% |
+| 0.1 | 2.15M | 0.05 | 100% | 90% | 65% | 22% |
+| **0.3** | **2.15M** | **0.03** | **100%** | **95%** | **70%** | **25%** |
+| 1.0 | 2.15M | 0.02 | 100% | 85% | 50% | 15% |
+
+Lessons:
+- Kick training moves the breaking point from ~0.2 to ~0.3 m/s in ~2M steps, and it holds on 30 s episodes.
+- With the old 0.01 smoothness penalty the policy learned a visible tremor: shaking was almost free in the reward, and
+  soft servos hid it in most training episodes. It only shows with stiff servos and low latency.
+- 0.3 removes the tremor at no cost in robustness; 1.0 is too sluggish for strong kicks.
+- Training success (~95% throughout) hid both the tremor and the 6.3M checkpoint's regression: always run the stress eval.
+- Set `--iters` to the real run length so the learning rate decays over it.
+
+Chosen PPO baseline: penalty 0.3, 2.15M steps (kept locally, not in git: `outputs/weights/ppo_kicks_smooth.pt`).
+
 ### GRPO training
 
 `sim/grpo.py` (advantages + clipped update) and `sim/train_grpo.py` (loop), with `EpisodicVecEnv` in `sim/vec_env.py`
@@ -51,10 +75,10 @@ flags as `train_controller.py`, so checkpoints work with every eval tool. Compar
 
 ```bash
 # PPO baseline with kicks
-uv run python -m sim.train_controller --name ppo_kicks --iters 9500 --act-hist 3 --grip-rot -90 --max-latency 4 \
+uv run python -m sim.train_controller --name ppo_kicks --iters 700 --smooth-penalty 0.3 --act-hist 3 --grip-rot -90 --max-latency 4 \
     --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
 # GRPO, same conditions and step budget
-uv run python -m sim.train_grpo --name grpo_kicks --total-steps 29.2e6 --act-hist 3 --grip-rot -90 --max-latency 4 \
+uv run python -m sim.train_grpo --name grpo_kicks --total-steps 6.45e6 --smooth-penalty 0.3 --act-hist 3 --grip-rot -90 --max-latency 4 \
     --home-penalty 0.1 --servo-rand --ball-noise 1.0 --episode-s 4 --kick-min 0 --kick-max 0.3 --kick-every 2 --kick-margin 1
 ```
 
