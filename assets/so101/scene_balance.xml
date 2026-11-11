@@ -22,6 +22,10 @@
         <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
         <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
 
+        <!-- Aim point of the base-mounted "ego" camera (see so101_new_calib_paddle.xml): ~18 cm above the blade centre at home,
+             so the paddle sits in the lower part of the image and a ball bouncing ~35 cm high stays in frame (see so101_new_calib_paddle.xml). -->
+        <body name="ego_target" pos="0.41 0 0.50" />
+
         <!-- Ping-pong ball: 40 mm, 2.7 g, hollow shell (I = 2/3 m r^2 = 7.2e-7) -->
         <body name="ball" pos="0.398 -0.002 0.290">
             <freejoint name="ball_joint" />

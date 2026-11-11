@@ -44,6 +44,18 @@
   <worldbody>
     <!-- Link base -->
     <body name="base" pos="0 0 0" quat="1 0 0 0" childclass="so101_new_calib">
+      <!-- Ego camera mount (printable add-on): a bracket screwed to the back face of the base (x = -31 mm) and a 16 mm post
+           up to a camera at 65 cm, behind the arm, looking over it at the paddle (aimed at ego_target in the scene).
+           Same camera as the wrist (62 deg vertical, ~90 deg diagonal, 640x480). Fixed to the base, so the view does not move
+           with the arm; the frame covers the paddle and ~35 cm of bounce height above it (~57 px margin at 640x480).
+           Visual only: no collisions, no effect on physics. -->
+      <geom name="ego_bracket" type="box" size="0.012 0.03 0.03" pos="-0.043 0 0.03" rgba="0.95 0.55 0.1 1"
+            contype="0" conaffinity="0" group="2"/>
+      <geom name="ego_post" type="cylinder" size="0.008 0.3065" pos="-0.047 0 0.3365" rgba="0.95 0.55 0.1 1"
+            contype="0" conaffinity="0" group="2"/>
+      <geom name="ego_cam_housing" type="box" size="0.012 0.03 0.012" pos="-0.047 0 0.655" rgba="0.1 0.1 0.1 1"
+            contype="0" conaffinity="0" group="2"/>
+      <camera name="ego" pos="-0.035 0 0.655" mode="targetbody" target="ego_target" fovy="62"/>
       <inertial pos="0.0137179 -5.19711e-05 0.0334843" mass="0.147" fullinertia="0.000114686 0.000136117 0.000130364 -4.59787e-07 4.97151e-06 9.75275e-08"/>
       <!-- Part base_motor_holder_so101_v1 -->
       <geom type="mesh" class="visual" pos="-0.00636471 -9.94414e-05 -0.0024" quat="0.5 0.5 0.5 0.5" mesh="base_motor_holder_so101_v1" material="base_motor_holder_so101_v1_material"/>
