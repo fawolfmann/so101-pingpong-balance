@@ -1,7 +1,8 @@
 """Watch the trained PPO controller balance the ball in the live MuJoCo viewer.
-Usage: uv run python -m sim.view_controller [--controller weights/controller.pt] [--rand] [--latency N] [--seed N] [--nudge SECONDS]
+Usage: uv run python -m sim.view_controller [--controller weights/controller.pt] [--rand] [--latency N] [--seed N] [--nudge SECONDS] [--seconds S]
   --rand      domain randomization on, with the settings the controller was trained with (latency, soft servos, noisy ball state)
   --latency   force a control latency of N extra steps (33 ms each)
+  --seconds S episode length in seconds (default 10, the training length)
   --nudge S   kick the ball sideways every S seconds (you can also Ctrl+right-drag the ball with the mouse)
 The policy only gets the controller observation (ball state in the blade frame + joints + recent actions); the actions are the policy mean."""
 import argparse
@@ -17,13 +18,14 @@ from sim.policies import controller_action, load_controller
 p = argparse.ArgumentParser()
 p.add_argument("--controller", default=str(Path(__file__).parent.parent / "weights/controller.pt")); p.add_argument("--rand", action="store_true")
 p.add_argument("--latency", type=int, default=None); p.add_argument("--seed", type=int, default=0); p.add_argument("--nudge", type=float, default=0.0)
-p.add_argument("--grip-rot", type=float, default=-90.0)
+p.add_argument("--grip-rot", type=float, default=-90.0); p.add_argument("--seconds", type=float, default=10.0, help="episode length (s)")
 a = p.parse_args()
 
 ac = load_controller(a.controller)
 ta = ac.train_args if a.rand else {}
 env = BalanceEnv(obs_mode="controller", domain_rand=a.rand, light_model=False, grip_rot_deg=a.grip_rot, act_hist=ac.act_hist,  # full visual model so the arm and paddle are drawn
-                 max_latency=ta.get("max_latency", 2), servo_rand=ta.get("servo_rand", False), ball_noise=ta.get("ball_noise", 0.0))
+                 max_latency=ta.get("max_latency", 2), servo_rand=ta.get("servo_rand", False), ball_noise=ta.get("ball_noise", 0.0),
+                 max_steps=round(a.seconds * 30))  # 30 Hz control
 seed = a.seed
 obs, _ = env.reset(seed=seed)
 if a.latency is not None:
