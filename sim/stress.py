@@ -1,7 +1,8 @@
 """Shared pieces for the stress eval and the critic-value analysis: env setup, ball kicks, one recorded episode.
 
-A kick adds `kick_speed` m/s of sideways velocity to the ball, in a random direction (same as eval_policy's nudges,
-which use 0.25 m/s). Kicks come one per `kick_every` seconds, at a random time inside each window, after a grace period.
+Kicks are BalanceEnv's own (the same code training uses): `kick_speed` m/s of sideways velocity in a random direction,
+one per `kick_every` seconds at a random time in each window, after 1 s, drawn from the episode seed. Here every kick
+has the same strength and kicks may land until the very end (no recovery margin).
 """
 from __future__ import annotations
 
@@ -10,10 +11,8 @@ import multiprocessing as mp
 import numpy as np
 import torch
 
-from sim.env import BalanceEnv
+from sim.env import CONTROL_HZ, BalanceEnv
 from sim.policies import controller_action
-
-CONTROL_HZ = 30
 
 
 def make_env(ac, max_steps: int = 300, light_model: bool | None = None) -> BalanceEnv:
@@ -23,15 +22,6 @@ def make_env(ac, max_steps: int = 300, light_model: bool | None = None) -> Balan
                       max_latency=ta.get("max_latency", 4), servo_rand=ta.get("servo_rand", False),
                       ball_noise=ta.get("ball_noise", 0.0), max_steps=max_steps,
                       light_model=light_model)
-
-
-def kick_schedule(rng: np.random.Generator, n_steps: int, every_s: float, grace_s: float = 1.0) -> dict[int, float]:
-    """{step: direction angle}: one kick at a random step inside each `every_s` window after `grace_s`."""
-    if every_s <= 0:
-        return {}
-    start, window = round(grace_s * CONTROL_HZ), max(1, round(every_s * CONTROL_HZ))
-    return {int(rng.integers(lo, min(lo + window, n_steps))): float(rng.uniform(0, 2 * np.pi))
-            for lo in range(start, n_steps, window)}
 
 
 def warning_lead(values: np.ndarray, threshold: float) -> int:
@@ -50,16 +40,15 @@ def run_episode(env: BalanceEnv, ac, seed: int, seconds: float, kick_speed: floa
     """One episode with the policy mean. Returns success/length/final distance; with record=True also per-step
     critic value, ball distance from the centre and the kick steps."""
     env.max_steps = round(seconds * CONTROL_HZ)
+    env.kick_speed, env.kick_every, env.kick_grace, env.kick_margin = (kick_speed, kick_speed), kick_every, 1.0, 0.0
     env.reset(seed=seed)
-    kicks = kick_schedule(np.random.default_rng(seed + 777), env.max_steps, kick_every) if kick_speed > 0 else {}
+    kicks = sorted(env.kicks)
     values, dists = [], []
     info: dict = {}
     for t in range(env.max_steps):
         obs = env.controller_obs()
         if record:
             values.append(float(ac.value(torch.as_tensor(obs[None]))[0]))
-        if t in kicks:
-            env.d.qvel[env.ball_vadr:env.ball_vadr + 2] += kick_speed * np.array([np.cos(kicks[t]), np.sin(kicks[t])])
         _, _, terminated, truncated, info = env.step(controller_action(ac, obs))
         if record:
             dists.append(info["dist"] * 1000)
@@ -68,7 +57,7 @@ def run_episode(env: BalanceEnv, ac, seed: int, seconds: float, kick_speed: floa
     ep = dict(seed=seed, seconds=seconds, kick_speed=kick_speed, success=bool(info["is_success"]),
               dropped=bool(info.get("fell") or info.get("bad_qacc")), length=t + 1, dist_mm=float(info["dist"] * 1000))
     if record:
-        ep.update(value=values, dist_trace=dists, kicks=sorted(kicks))
+        ep.update(value=values, dist_trace=dists, kicks=kicks)
     return ep
 
 

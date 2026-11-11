@@ -27,9 +27,20 @@ Each step changes one thing, so when a result is worse you know why.
 
 Baseline (pretrained PPO controller, MuJoCo 4.0):
 - No kicks: 100% at 10, 20 and 30 s, so episode length alone is not a problem.
-- Breaking point at 0.15–0.2 m/s kicks: 80% → 48% success at 10 s. At 0.25 m/s, 0% beyond 10 s. It was never trained with kicks.
+- Breaking point at 0.15–0.2 m/s kicks: ~80% → ~50% success at 10 s. At 0.25 m/s, 0–5% beyond 10 s.
+  It was never kicked in training: the only ball motion was a start velocity of at most 0.03 m/s per axis.
 - The critic is a weak drop predictor: its value falls only ~0.2–0.5 s before a drop, and balanced episodes dip just as
   low right after a kick (at the 1st-percentile threshold: catches 18% of drops, 56% false alarms).
+
+### Kicks in training
+
+`BalanceEnv` can kick the ball mid-episode (`kick_min`/`kick_max` m/s, one per `kick_every` s, none in the first
+`kick_grace` s or the last `kick_margin` s). The schedule comes from the reset seed only, so episodes reset with the same
+seed get identical kicks, which is what GRPO groups need. The policy is not told about kicks. Training flags:
+`--episode-s`, `--kick-min`, `--kick-max`, `--kick-every`, `--kick-margin`. The stress tools use the same code.
+
+A kick sets the ball sliding without spin; friction turns that into rolling within one step, so a hollow ping-pong ball
+(I = ⅔mr²) ends up moving at ⅗ of the kick speed.
 
 ## How the pieces fit (what each change touches)
 
