@@ -134,6 +134,49 @@ The smallest change and a good first loop of "edit → check → retrain → eva
 
 **Done when:** the full-pipeline success rate is close to the current one (113/120 in the README).
 
+### Ego camera: results
+
+A base-mounted camera on a 65 cm post (`ego`, 62° lens, 256x192), kept as a second option next to the wrist camera.
+Full pipeline (camera → detector → estimator → FdVel → `ppo_kicks_smooth` controller), randomized servos,
+latency 0/2/4, 30 episodes each; "nudges" = two 0.25 m/s pushes per episode.
+
+| estimator (`--camera`) | inputs | no nudges | 2 nudges | est err u/w (cm, no nudges) |
+|---|---|---|---|---|
+| wrist (shipped `weights/estimator.pt`) | 3 detections | 81/90 | 69/90 | 0.39 / 1.29 |
+| ego, first version | + current joints | 78/90 | 25/90 | 1.02 / 1.32 |
+| ego + joint history | + joints of all 3 frames | 86/90 | 23/90 | 0.91 / 1.49 |
+| **ego**, decorrelated data | + joints of all 3 frames | **87/90** | 64/90 | 0.21 / 0.72 |
+| ego_pose, decorrelated | + camera mount offset | 86/90 | 64/90 | 0.40 / 0.82 |
+| ego_track, decorrelated | tracking camera, + pan/tilt | 83/90 | **68/90** | 0.21 / 0.62 |
+
+What mattered, in order:
+
+1. **The arm pose gave the ball away.** The data was collected with the controller acting on the true ball, so it tilts
+   toward the ball: from the joint angles alone a quadratic fit predicts the ball's w with R² 0.69. An estimator that
+   sees the joints learns that shortcut. In closed loop the arm follows the *estimate* instead, the shortcut is wrong,
+   and the estimate drifts slowly (±1.4 cm within an episode, ~0.1 Hz) while the controller holds it at the centre.
+   Fix: `--target-offset 0.3` — during collection the controller balances around a random moving target (per-episode
+   offset + ~2 s drift), so the pose no longer tells where the ball is (R² 0.21). Drift 1.2/1.5 → 0.28/0.43 cm.
+   Same idea as DAgger: train on the state distribution the estimator will meet in closed loop.
+2. Joint history (each detection paired with the pose it was taken at): needed for a camera that does not move with
+   the paddle, but on its own it barely changed anything (error at the fastest arm motion 0.81 → 0.76 cm).
+3. Camera mount offset as input (`ego_pose`, from a calibration on the real arm): no gain. With the camera
+   randomization off the remaining bias halves (w 0.60 → 0.33 cm), but the estimator did not learn to use the inputs.
+4. Tracking camera (`ego_track`, `BalanceEnv(cam_track=True)`): pan/tilt servo steered by its own detections
+   (`env.track_detection`, nominal FOV only, 6 rad/s limit), keeps the ball within ±0.02 of the image centre. About the
+   same success as the fixed camera, but the error stays flat with ball distance (5-8 cm: 0.36/0.74 vs 0.67/1.01 cm),
+   which is what a bouncing ball needs. On the real arm: two extra servos on the post.
+
+Two sim pitfalls found on the way: a tracker aimed from the true ball position leaks the answer through its pan/tilt
+(estimate error 0.06 cm, not achievable), and a camera moved by editing `m.cam_quat` renders one step late unless
+`mj_camlight` runs after the change.
+
+```bash
+uv run python -m perception.estimator --name ego_dc --camera ego --target-offset 0.3 --controller outputs/weights/ppo_kicks_smooth.pt
+uv run python -m perception.estimator --eval outputs/estimator/ego_dc.pt --controller outputs/weights/ppo_kicks_smooth.pt \
+    --latency 0,2,4 --episodes 30 --servo-rand --nudges 2
+```
+
 ## 2. PPO → GRPO
 
 Keep the ball task, so PPO's 97.5% is the target to compare against.

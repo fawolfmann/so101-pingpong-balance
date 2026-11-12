@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from perception import detector
-from perception.estimator import CAMERAS, Estimator, EstRunner, load_est
+from perception.estimator import CAMERAS, N_DET, Estimator, EstRunner, load_est, with_joint_history
 from sim.env import BalanceEnv
 
 
@@ -40,18 +40,80 @@ def test_env_renders_the_chosen_camera_at_the_chosen_size():
 
 
 def test_estimator_inputs_per_camera(tmp_path):
-    assert CAMERAS["wrist"]["n_in"] == 12 and CAMERAS["ego"]["n_in"] == 17
-    m = Estimator(n_in=17)
+    assert CAMERAS["wrist"]["n_in"] == 12 and CAMERAS["ego"]["n_in"] == 27
+    m = Estimator(n_in=27)
     path = tmp_path / "e.pt"
-    torch.save(dict(model=m.state_dict(), arch=dict(n_in=17), camera="ego"), path)
+    torch.save(dict(model=m.state_dict(), arch=dict(n_in=27), camera="ego"), path)
     loaded = load_est(path)
-    assert loaded.n_in == 17 and loaded.camera == "ego"
+    assert loaded.n_in == 27 and loaded.camera == "ego"
     run = EstRunner(loaded)
     out = run.update(np.array([0.1, 0.2, 0.8, 1.0], np.float32), joints=np.zeros(5, np.float32))
     assert out.shape == (4,)
+
+
+def test_joint_history_pairs_each_detection_with_its_pose():
+    # two episodes: rows 0-2 (ep 7), rows 3-4 (ep 8); joints of row i are all i
+    x = torch.zeros(5, N_DET + 5)
+    x[:, N_DET:] = torch.arange(5.0)[:, None]
+    h = with_joint_history(x, torch.tensor([7, 7, 7, 8, 8]), 3)
+    assert h.shape == (5, N_DET + 15)
+    oldest_to_newest = h[:, N_DET::5]  # first joint of each of the 3 frames
+    np.testing.assert_array_equal(oldest_to_newest.numpy(), [[0, 0, 0], [0, 0, 1], [0, 1, 2], [3, 3, 3], [3, 3, 4]])
+
+
+def test_runner_feeds_the_same_history_as_training():
+    m = Estimator(n_in=27)
+    seen = []
+    m.forward = lambda d: (seen.append(d[0].numpy().copy()), torch.zeros(1, 4))[1]
+    run = EstRunner(m)
+    det = np.array([0.1, 0.2, 0.8, 1.0], np.float32)
+    for i in range(3):
+        run.update(det, joints=np.full(5, i, np.float32))
+    np.testing.assert_array_equal(seen[-1][N_DET::5], [0, 1, 2])
+    np.testing.assert_array_equal(seen[1][N_DET::5], [0, 0, 1])
+
+
+def test_first_ego_version_with_current_joints_still_runs():
+    run = EstRunner(Estimator(n_in=17))
+    assert run.update(np.array([0.1, 0.2, 0.8, 1.0], np.float32), joints=np.zeros(5, np.float32)).shape == (4,)
 
 
 def test_wrist_estimator_still_loads_without_joints():
     est = load_est("weights/estimator.pt")  # shipped checkpoint, saved before cameras existed
     assert est.n_in == 12 and est.camera == "wrist"
     assert EstRunner(est).update(np.array([0.1, 0.2, 0.8, 1.0], np.float32)).shape == (4,)
+
+
+def test_profile_input_sizes():
+    sizes = {k: (v["n_aux"], v["n_in"]) for k, v in CAMERAS.items()}
+    assert sizes == {"wrist": (0, 12), "ego": (5, 27), "ego_pose": (12, 48), "ego_track": (7, 33)}
+
+
+def test_tracking_camera_centres_the_ball_and_reports_its_aim():
+    from perception.estimator import aux_inputs, make_env, observe
+    p = CAMERAS["ego_track"]
+    env = make_env("ego_track", seed=0)
+    obs, _ = env.reset(seed=3)
+    first = observe(env, obs, p)  # aimed at the blade centre; the ball sits a little off it
+    for _ in range(4):  # steered only by its own detections
+        obs, *_ = env.step(np.zeros(5))
+        det = observe(env, obs, p)
+    assert det[3] == 1 and np.abs(det[:2]).max() < 0.05 and np.abs(det[:2]).max() < np.abs(first[:2]).max()
+    fixed, _ = make_env("ego", seed=0).reset(seed=3)
+    assert abs(detector.detect(fixed["image"], **p["det"])[1]) > 0.3  # the fixed camera aims above the blade
+    aux = aux_inputs(env, p)
+    assert aux.shape == (7,) and np.abs(aux[5:]).max() > 0.1  # pan/tilt moved away from the nominal aim
+
+
+def test_camera_mount_features_follow_the_randomized_offset():
+    from perception.estimator import aux_inputs, make_env
+    env = make_env("ego_pose", domain_rand=True, cam_rand=1.0)
+    env.reset(seed=5)
+    f = aux_inputs(env, CAMERAS["ego_pose"])[5:]
+    n = env._nominal
+    np.testing.assert_allclose(f[:3] * 0.004, env.m.cam_pos[env.cam_id] - n["cam_pos"], atol=1e-6)
+    np.testing.assert_allclose(f[6] * 4.0, env.m.cam_fovy[env.cam_id] - n["cam_fovy"], atol=1e-4)
+    assert np.abs(f).max() <= 1.6
+    plain = make_env("ego_pose")  # no domain randomization: no offset
+    plain.reset(seed=5)
+    assert np.all(plain.cam_features() == 0)
