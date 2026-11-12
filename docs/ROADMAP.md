@@ -209,14 +209,15 @@ episodes, smooth penalty 0.3), from scratch, stopped at 2000 iterations (6.1M st
 
 | | no nudges | 2 nudges | latency 4, 2 nudges |
 |---|---|---|---|
-| wrist estimator + controller | 81/90 | 69/90 | 24/30 |
-| ego_dc estimator + controller | 87/90 | 64/90 | 12-15/30 (all ego variants) |
-| ego_track (rule-steered camera) + estimator + controller | 83/90 | 68/90 | 12-15/30 |
+| wrist estimator + controller | 81/90 | 69/90 | 21/30 |
+| ego_dc estimator + controller | 87/90 | 64/90 | 12/30 |
+| ego_track (rule-steered camera) + estimator + controller | 83/90 | 68/90 | 15/30 |
 | **arm + camera policy, rendered** | **90/90** | **69/90** | **19/30** |
 | arm + camera policy, simulated detections | 88/90 | 62/90 | 14/30 |
 
 - Best camera result without nudges (90/90), level with the best with nudges; the weak spot is still latency 4 with
-  pushes, better than the ego estimators but behind the wrist camera.
+  pushes: 19/30, better than the ego estimators (12-15/30) and close to the wrist camera (21/30; 30 episodes per
+  cell, so ±2-3 is noise).
 - Rendered evaluation is slightly *better* than simulated: the trained-on model misses 4.2% of in-view frames (the
   rendered evaluation lost the ball in 0.6% of frames) and scales errors up to 1.5x per episode, so it errs on the
   pessimistic side.
