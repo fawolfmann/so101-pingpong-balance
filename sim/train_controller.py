@@ -95,6 +95,8 @@ def main():
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
                    "the bouncing critic inputs gets zero weights for them)")
     p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std to this (0 = keep)")
+    p.add_argument("--critic-warmup", type=int, default=0, help="with --init-from: train only the critic for this many "
+                   "iterations (the actor stays frozen until the value estimates fit the new task)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-entity", default=None, help="wandb username or team (needed if the account has no default entity)")
@@ -206,7 +208,10 @@ def main():
                     B["vnext"][t, i] = v
         adv, ret = compute_gae(B["rew"], B["val"], B["vnext"], B["done"], a.gamma, a.lam)
 
-        # 3. PPO update
+        # 3. PPO update (during --critic-warmup only the critic learns)
+        warm = it <= getattr(a, "critic_warmup", 0)
+        for prm in [*ac.actor.parameters(), ac.log_std]:
+            prm.requires_grad_(not warm)
         flat = lambda x: torch.as_tensor(x.reshape(T * N, *x.shape[2:]), device=dev)
         batch = dict(obs=flat(B["obs"]), act=flat(B["act"]), logp=flat(B["logp"]), adv=flat(adv), ret=flat(ret))
         s = ppo_update(ac, opt, batch, ent_coef=a.ent_coef)

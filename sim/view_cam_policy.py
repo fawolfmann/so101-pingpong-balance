@@ -2,6 +2,8 @@
 
     uv run mjpython -m sim.view_cam_policy                                   # macOS (mjpython); Linux: python
     uv run mjpython -m sim.view_cam_policy --nudge 2.5 --latency 2 --seconds 15
+    uv run mjpython -m sim.view_cam_policy --policy outputs/controller/cam_bounce/best.pt --nudge 2.5 --nudge-up 0.5,1.5
+        # bouncing: every push also kicks the ball up (m/s); the contact is elastic when the policy was trained with it
 
 Every step: render the camera -> whole-ball candidates -> tracker -> policy -> 5 joint moves + pan/tilt. On screen:
   inset (bottom left)  the camera image; green ring = ball seen, yellow = tracker coasting on its prediction
@@ -47,13 +49,21 @@ def main() -> None:
     p.add_argument("--nudge", type=float, default=0.0, help="push the ball (0.25 m/s) every this many seconds")
     p.add_argument("--latency", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--nudge-up", default="", help="upward speed range added to every push, 'lo,hi' m/s")
+    p.add_argument("--contact-damp", default="", help="elastic contact damping 'lo,hi' (default: the policy's training value)")
     a = p.parse_args()
     if not Path(a.policy).exists():
         raise SystemExit(f"missing checkpoint {a.policy}")
     ac = load_controller(a.policy)
     ta = ac.train_args
+    damp = a.contact_damp or ta.get("contact_damp", "")
+    up = tuple(float(v) for v in a.nudge_up.split(",")) if a.nudge_up else None
     env = CamPolicyEnv(render=True, frames=ta.get("frames", 3), act_hist=ta["act_hist"], domain_rand=True, servo_rand=True,
-                       cam_rand=0.3, max_latency=max(a.latency, 1), max_steps=round(a.seconds * CONTROL_HZ))
+                       cam_rand=0.3, max_latency=max(a.latency, 1), max_steps=round(a.seconds * CONTROL_HZ),
+                       track_gate=ta.get("track_gate", 0.0),
+                       **(dict(contact_damp=tuple(float(v) for v in damp.split(","))) if damp else {}))
+    if up:
+        env.env.airborne_ok = True
     e = env.env
     rng = np.random.default_rng(a.seed)
     every = round(a.nudge * CONTROL_HZ) if a.nudge > 0 else 0
@@ -75,7 +85,8 @@ def main() -> None:
             act = controller_action(ac, obs[:ac.actor_dim])
             if end_step is None and every and e.t > 0 and e.t % every == 0:
                 ang = rng.uniform(0, 2 * np.pi)
-                e.d.qvel[e.ball_vadr:e.ball_vadr + 2] += 0.25 * np.array([np.cos(ang), np.sin(ang)])
+                vz = rng.uniform(*up) if up else 0.0
+                e.d.qvel[e.ball_vadr:e.ball_vadr + 3] += np.r_[0.25 * np.cos(ang), 0.25 * np.sin(ang), vz]
             obs, _, te, tr, info = env.step(act)
             det = info["det"]
             img = env.last_image  # the frame the policy's detector just saw

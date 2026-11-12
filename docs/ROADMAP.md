@@ -233,6 +233,69 @@ uv run python -m sim.eval_cam_policy --policy outputs/controller/cam_policy/best
 uv run mjpython -m sim.view_cam_policy --nudge 2.5                     # watch it
 ```
 
+### Bouncing: kicks in 3 axes (iteration 1)
+
+The ball can now move in all 3 axes: kicks get a random upward component, the ball flies off the paddle and bounces
+when it lands, and the arm + camera policy is fine-tuned to catch it, settle it and keep it centred.
+
+- Kicks (`--kick-z-min/--kick-z-max`, m/s): an upward speed on the kicks of a `--kick-z-frac` share of the episodes;
+  the rest keep the original sideways kicks, so plain balancing stays trained.
+- Elastic contact (`--contact-damp lo,hi`, MuJoCo direct `solref = (-40000, -damping)`): drop tests on a still paddle
+  give restitution ~0.86 (damping 20), ~0.80 (30), ~0.75 (40); the original contact lands dead (~0.1).
+- Termination: the ball may be in the air; the episode fails if it falls past the blade, lands off it, goes > 20 cm
+  sideways or > 50 cm up. Success also needs it back on the blade at the end.
+- **Reward unchanged** (centred, slow ball, smooth, near home, -5 on a drop): the best answer to an upward kick is to
+  follow the ball, cushion the landing and settle it. Nothing rewards keeping it bouncing.
+- Starts from the exact `cam_policy` weights: the actor's inputs are unchanged; the critic gets 2 more (ball lift and
+  normal velocity) with zero initial weights (`expand_critic`, `--init-from`).
+
+**Forgetting.** The first fine-tune (exploration std raised 0.09 -> 0.15, 40% sideways episodes) lost balancing
+faster than it learned bouncing: after 400 iterations, sideways pushes 60 -> 34/90, upward kicks 19 -> 26/90
+(`outputs/controller/cam_bounce_v1_forgot`). Restarted with `--critic-warmup 100` (only the critic learns for 100
+iterations, so its value estimates fit the new task before they move the policy), the base std, and 50% sideways
+episodes: sideways training success then stayed at the base level (76%) while upward kicks improved.
+
+Result (`cam_bounce`, 1500 iterations from `cam_policy`, 4.6M steps, 25 min; upward kicks 0.5-1.5 m/s in 50% of the
+episodes, elastic contact damping 20-40). Rendered, latency 0/2/4, 30 episodes each, two pushes per episode:
+
+| test | `cam_policy` (balance only) | `cam_bounce` |
+|---|---|---|
+| pushes with an upward kick 0.5-1.5 m/s, elastic contact | 21/90 (latency 0/2/4: 15/6/0) | **31/90** (15/14/2) |
+| sideways pushes, original contact (the #2 test) | 69/90 | 67/90 |
+| sideways pushes, elastic contact | 60/90 (simulated detections) | 64/90 |
+| no pushes, elastic contact | 90/90 (original contact) | 88/90 |
+
+- Balancing is kept (within the ±2-3 noise of 30 episodes per cell); upward kicks +10, mostly at latency 2 (6 -> 14).
+- Most upward kicks are still lost, almost all of them at latency 4: catching a bouncing ball needs a faster
+  reaction than settling a rolling one. Training success on upward kicks stayed at 25-40% from iteration 500 on.
+- Command: as in the PR (`train_controller --cam-policy --init-from outputs/controller/cam_policy/best.pt
+  --critic-warmup 100 --lr 1e-4 --episode-s 5 --kick-margin 1.5 --kick-z-min 0.5 --kick-z-max 1.5 --kick-z-frac 0.5
+  --contact-damp 20,40 --track-gate 0.3 ...` with the `cam_policy` recipe); evaluate with
+  `eval_cam_policy --nudges 2 --contact-damp 20,40 --nudge-up 0.5,1.5`; watch with
+  `uv run mjpython -m sim.view_cam_policy --policy outputs/controller/cam_bounce/last.pt --nudge 2.5 --nudge-up 0.5,1.5`.
+
+### Next: juggling (reward to try, iteration 2)
+
+Goal: keep the ball bouncing on the paddle for as long as possible without dropping it. Not a target height: the
+score is the time the ball stays juggled.
+
+- **Episode**: starts with the ball dropped onto the paddle from ~10 cm; long episodes (20-30 s) so that time
+  juggled can grow; no kicks needed at first (the bouncing is the task), random kicks later as a robustness test.
+- **Juggling state**: a bounce counts when the ball leaves the blade and its flight peaks at least ~3 cm above its
+  resting position (no credit for tiny vibrations). The ball is *juggled* while the time since the last counted bounce
+  is under ~1 s.
+- **Reward**: +1 per step while juggled, so the return is the time juggled (x 30 steps/s). Resting the ball counts
+  as stopping: after ~1 s without a bounce the episode ends (no reward for holding it). -5 on a drop, as now.
+  Small shaping kept from balancing: centring of the landing point (keeps the ball from drifting to the edge),
+  the smoothness and home-pose penalties (reduced: hitting the ball needs quick moves).
+- **Metrics**: time juggled before a drop or a stall, bounces per episode, bounce height spread.
+- **Critic extra (training only)**: ball lift and vertical velocity (already there), time since the last bounce.
+- **One policy for both?** To keep balancing in the same network, add a mode input (0 = balance, 1 = juggle) and mix
+  both kinds of episode, as iteration 1 mixes sideways and upward kicks; start from the iteration-1 policy with zero
+  weights for the new input.
+- Watch for: hitting the ball needs fast paddle moves (action limit 0.04 rad per step, soft randomized servos) and a
+  camera that follows a ball moving fast in the image (tracker distance fallback, `--track-gate`).
+
 ## 2. PPO → GRPO
 
 Keep the ball task, so PPO's 97.5% is the target to compare against.
