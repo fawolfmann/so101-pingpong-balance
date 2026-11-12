@@ -5,7 +5,9 @@
 
 Same test as perception.estimator --eval: seeds 10000+i, servo and camera randomization, latency forced per row,
 --nudges pushes of 0.25 m/s at random steps. Bouncing: --nudge-up lo,hi adds an upward speed to every push (m/s),
---contact-damp lo,hi makes the ball/blade contact elastic (as in training with those flags). Also reports how the camera was used: detection rate, ball offset from
+--contact-damp lo,hi makes the ball/blade contact elastic (as in training with those flags).
+Juggling: --juggle runs juggling episodes (ball dropped from --juggle-drop, no pushes, --seconds long) and reports the
+time juggled, bounces, and how episodes ended (time up, stall, drop). Also reports how the camera was used: detection rate, ball offset from
 the image centre, pan/tilt speed.
 """
 from __future__ import annotations
@@ -26,6 +28,10 @@ def _init(cfg):
     ac = load_controller(cfg["policy"])
     ta = ac.train_args
     extra = dict(contact_damp=cfg["contact_damp"]) if cfg["contact_damp"] else {}
+    if ta.get("juggle_frac", 0.0) > 0:  # the policy has the mode input
+        extra.update(juggle=True, height_info=True, juggle_drop=cfg["juggle_drop"])
+    if cfg["seconds"]:
+        extra["max_steps"] = round(cfg["seconds"] * 30)
     _G.update(cfg=cfg, ac=ac, env=CamPolicyEnv(render=not cfg["sim_det"], frames=ta.get("frames", 3), act_hist=ta["act_hist"],
                                               domain_rand=True, servo_rand=True, cam_rand=0.3, max_latency=cfg["max_lat"],
                                               track_gate=ta.get("track_gate", 0.0), **extra))
@@ -37,7 +43,7 @@ def _episode(job):
     from sim.policies import controller_action
     lat, seed = job
     cfg, env, ac = _G["cfg"], _G["env"], _G["ac"]
-    obs, _ = env.reset(seed=seed)
+    obs, _ = env.reset(seed=seed, **(dict(juggle=True) if cfg["juggle"] else {}))
     env.env._action_delay, env.env._delay_buf, env._cam_buf = lat, [np.zeros(5)] * lat, [np.zeros(2)] * lat
     rng = np.random.default_rng(seed + 777)  # the same nudges as perception.estimator's evaluation
     nudges = {int(t): rng.uniform(0, 2 * np.pi) for t in rng.integers(30, 280, cfg["nudges"])}
@@ -55,6 +61,9 @@ def _episode(job):
             off.append(np.abs(det[:2]).max())
         if te or tr:
             break
+    if cfg["juggle"]:
+        return dict(lat=lat, success=bool(info["is_success"]), juggle_s=info["juggle_s"], n_bounces=info["n_bounces"],
+                    stalled=bool(info["stalled"]), fell=bool(info["fell"]), apex=info["apex_mean"], seen=float(np.mean(seen)))
     return dict(lat=lat, success=bool(info["is_success"]), length=t + 1, dist_mm=float(info["dist"] * 1000), seen=float(np.mean(seen)),
                 off=float(np.mean(off)) if off else 1.0, cam=float(np.mean(cam_speed)))
 
@@ -69,16 +78,33 @@ def main():
     p.add_argument("--workers", type=int, default=6)
     p.add_argument("--nudge-up", default="", help="upward speed range added to every push, 'lo,hi' m/s")
     p.add_argument("--contact-damp", default="", help="elastic ball/blade contact, damping range 'lo,hi'")
+    p.add_argument("--juggle", action="store_true", help="juggling episodes (needs a policy trained with --juggle-frac)")
+    p.add_argument("--juggle-drop", default="0.08,0.15", help="juggling: drop height range, m")
+    p.add_argument("--seconds", type=float, default=0.0, help="episode length (default 10 s)")
     a = p.parse_args()
     pair = lambda v: tuple(float(x) for x in v.split(",")) if v else None
     lats = [int(v) for v in a.latency.split(",")]
     jobs = [(lat, 10_000 + i) for lat in lats for i in range(a.episodes)]
     cfg = dict(policy=a.policy, nudges=a.nudges, sim_det=a.sim_det, max_lat=max(lats), nudge_up=pair(a.nudge_up),
-               contact_damp=pair(a.contact_damp))
+               contact_damp=pair(a.contact_damp), juggle=a.juggle, seconds=a.seconds,
+               juggle_drop=pair(a.juggle_drop))
+    if a.juggle and not a.contact_damp:
+        cfg["contact_damp"] = (20.0, 40.0)  # juggling needs the elastic paddle
     with mp.get_context("spawn").Pool(a.workers, _init, (cfg,)) as pool:
         res = pool.map(_episode, jobs, chunksize=1)
     print(f"\n{a.policy} | {'simulated' if a.sim_det else 'rendered'} detections | {a.episodes} episodes per row | nudges {a.nudges}"
-          + (f" | push up {a.nudge_up} m/s" if a.nudge_up else "") + (f" | contact damp {a.contact_damp}" if a.contact_damp else ""))
+          + (f" | push up {a.nudge_up} m/s" if a.nudge_up else "") + (f" | contact damp {cfg['contact_damp']}" if cfg["contact_damp"] else "")
+          + (f" | JUGGLING, drop {a.juggle_drop} m" if a.juggle else ""))
+    if a.juggle:
+        print(f"{'latency':>8} {'juggled to the end':>19} {'mean s':>7} {'median s':>9} {'bounces':>8} {'stalls':>7} {'drops':>6} {'apex cm':>8}")
+        for lat in lats + ([None] if len(lats) > 1 else []):
+            rs = [r for r in res if lat is None or r["lat"] == lat]
+            js = np.array([r["juggle_s"] for r in rs])
+            ap = [r["apex"] for r in rs if np.isfinite(r["apex"])]
+            print(f"{'all' if lat is None else lat:>8} {sum(r['success'] for r in rs):>12}/{len(rs):<6} {js.mean():7.1f} {np.median(js):9.1f}"
+                  f" {np.mean([r['n_bounces'] for r in rs]):8.1f} {sum(r['stalled'] for r in rs):7d} {sum(r['fell'] for r in rs):6d}"
+                  f" {100 * np.mean(ap) if ap else float('nan'):8.1f}")
+        return
     print(f"{'latency':>8} {'success':>9} {'len':>5} {'final dist':>11}  {'ball seen':>9} {'|offset|':>9} {'cam |a|':>8}")
     for lat in lats + ([None] if len(lats) > 1 else []):
         rs = [r for r in res if lat is None or r["lat"] == lat]
