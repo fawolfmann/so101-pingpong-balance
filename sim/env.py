@@ -21,8 +21,10 @@ blade at the end. The reward is unchanged (centred, slow ball): catch it softly 
 Juggling (per episode: reset(options={"juggle": True, "drop": h})): the ball is dropped from h above its resting
 position, no kicks, and the task is to keep it bouncing. A bounce counts when its flight peaks >= JUGGLE_MIN_APEX above
 the resting position; the ball is juggled while the last counted bounce (or the drop) is under JUGGLE_STALL_S old.
-Reward per step: 1 while juggled + JUGGLE_CENTRE_W * centring - the smoothness and home penalties; the episode ends on
-a drop (-5) or a stall (no counted bounce for JUGGLE_STALL_S: holding the ball earns nothing). Success: juggled to the end.
+Reward per step: 1 while juggled + JUGGLE_CENTRE_W * centring - the smoothness (juggle_smooth: sharp hits allowed) and
+home penalties, + a straight-hit bonus at each counted bounce (largest when it peaks over the centre); the episode ends on
+a drop or a stall (no counted bounce for JUGGLE_STALL_S: holding the ball earns nothing), with no extra penalty for
+either: the score is the time juggled. Success: juggled to the end.
 """
 from __future__ import annotations
 
@@ -61,6 +63,7 @@ BOUNCE_STIFF = 40000.0
 JUGGLE_MIN_APEX = 0.03  # m above the resting position: a smaller hop is not a bounce
 JUGGLE_STALL_S = 1.0  # s without a counted bounce: stalled
 JUGGLE_CENTRE_W = 0.2  # centring shaping in juggling episodes
+JUGGLE_STRAIGHT_W, JUGGLE_STRAIGHT_SIGMA = 1.0, 0.03  # bonus per counted bounce: W * exp(-(offset at the apex / SIGMA)^2)
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
 
@@ -134,6 +137,7 @@ class BalanceEnv(gym.Env):
         kick_z_max: float = 0.0,
         kick_z_frac: float = 1.0,  # share of the episodes whose kicks get the upward component
         contact_damp: tuple[float, float] | None = None,  # elastic ball/blade contact, damping drawn per episode
+        juggle_smooth: float | None = None,  # smoothness penalty in juggling episodes (None: smooth_penalty)
         seed: int | None = None,
     ):
         if not 0.0 <= kick_min <= kick_max:
@@ -155,6 +159,7 @@ class BalanceEnv(gym.Env):
         self.airborne_ok = kick_z_max > 0 or contact_damp is not None  # the ball may leave the blade
         self.kick_z_on = False  # this episode's kicks have an upward component
         self.juggle = False  # this episode is a juggling episode (reset option)
+        self.juggle_smooth = juggle_smooth
 
         self.grip_rot_deg = grip_rot_deg
         # wrist roll compensates the grip rotation, so the blade has the same world pose
@@ -363,7 +368,7 @@ class BalanceEnv(gym.Env):
         self.kicks = self._draw_kicks(seed)
         if self.juggle:  # the bouncing is the task: no kicks; the drop counts as the first bounce
             self.kicks, self.kick_z_on = {}, False
-            self.n_bounces, self._last_bounce, self._vz_prev, self._apexes = 0, 0, 0.0, []
+            self.n_bounces, self._last_bounce, self._vz_prev, self._apexes, self._apex_offsets = 0, 0, 0.0, [], []
         if self.cam_track:  # start aimed at the blade centre (known from the arm's kinematics)
             self._aim, self._aim_want = self._yaw_pitch(self._parent_dir(self.d.geom_xpos[self.blade_geom])), None
             self._apply_aim()
@@ -444,12 +449,15 @@ class BalanceEnv(gym.Env):
         u, w, h, speed = self.ball_in_blade()
         dist = float(np.hypot(u, w))
         centre = 1.0 - min(dist / self.blade_radius, 1.0)
-        if self.juggle:  # 1 per step while juggled (the return is the time juggled), light centring
-            juggled = self._count_bounce()
-            reward = float(juggled) + JUGGLE_CENTRE_W * centre
+        smooth = self.smooth_penalty
+        if self.juggle:  # 1 per step while juggled (the return is the time juggled), light centring, straight hits
+            juggled, straight = self._count_bounce(dist)
+            reward = float(juggled) + JUGGLE_CENTRE_W * centre + straight
+            if self.juggle_smooth is not None:
+                smooth = self.juggle_smooth  # hitting needs quick moves
         else:  # reward (true ball state): near the centre, slow ball
             reward = centre - 0.05 * speed
-        reward -= self.smooth_penalty * float(np.sum((a - self._prev_action) ** 2))
+        reward -= smooth * float(np.sum((a - self._prev_action) ** 2))
         if self.home_penalty:
             reward -= self.home_penalty * float(np.sum(((self.d.qpos[self.q_adr] - self.home_q) / 0.349) ** 2))
         if self.ball_noise:
@@ -466,30 +474,36 @@ class BalanceEnv(gym.Env):
         bad = bool(self.d.warning[mujoco.mjtWarning.mjWARN_BADQACC].number)
         stalled = self.juggle and not juggled
         terminated = bool(fell or bad or stalled)
-        if fell or bad:
-            reward -= 5.0
+        if (fell or bad) and not self.juggle:
+            reward -= 5.0  # juggling: a drop and a stall both just end the score (time juggled); an extra drop
+            # penalty made catching and holding the ball the safe choice
         truncated = self.t >= self.max_steps
         if self.juggle:
             success = bool(truncated and not terminated)
             extra = dict(stalled=bool(stalled), n_bounces=self.n_bounces, juggle_s=self.t / CONTROL_HZ,
-                         apex_mean=float(np.mean(self._apexes)) if self._apexes else float("nan"))
+                         apex_mean=float(np.mean(self._apexes)) if self._apexes else float("nan"),
+                         apex_offset=float(np.mean(self._apex_offsets)) if self._apex_offsets else float("nan"))
         else:
             success = bool(truncated and not terminated and dist < self.success_radius and on_blade)
             extra = {}
         return self._obs(), float(reward), terminated, truncated, self._info(dist=dist, fell=bool(fell), bad_qacc=bad,
                                                                             is_success=success, **extra)
 
-    def _count_bounce(self) -> bool:
+    def _count_bounce(self, dist: float) -> tuple[bool, float]:
         """Juggling: at the top of each flight (vertical velocity turns negative, ball off the blade), count a bounce if
-        it peaked >= JUGGLE_MIN_APEX above the resting position. Returns True while juggled (last bounce recent)."""
+        it peaked >= JUGGLE_MIN_APEX above the resting position. Returns (juggled: last bounce recent, straight-hit
+        bonus: JUGGLE_STRAIGHT_W at a counted apex right over the blade centre, falling off with the offset `dist`)."""
         lift, _ = self.ball_lift()
         vz = float(self.d.qvel[self.ball_vadr + 2])
+        bonus = 0.0
         if self._vz_prev > 0 >= vz and lift >= JUGGLE_MIN_APEX:
             self.n_bounces += 1
             self._last_bounce = self.t
             self._apexes.append(lift)
+            self._apex_offsets.append(dist)
+            bonus = JUGGLE_STRAIGHT_W * float(np.exp(-(dist / JUGGLE_STRAIGHT_SIGMA) ** 2))
         self._vz_prev = vz
-        return self.t - self._last_bounce <= round(JUGGLE_STALL_S * CONTROL_HZ)
+        return self.t - self._last_bounce <= round(JUGGLE_STALL_S * CONTROL_HZ), bonus
 
     def _render(self):
         if self._renderer is None:

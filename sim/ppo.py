@@ -58,11 +58,14 @@ def compute_gae(rew, val, val_next, done, gamma=0.99, lam=0.95):
     return adv, adv + val
 
 
-def ppo_update(ac, opt, batch, epochs=10, minibatches=8, clip=0.2, vf_coef=0.5, ent_coef=0.0, max_grad=0.5, target_kl=0.03):
-    """PPO update on a batch dict (obs, act, logp, adv, ret). Returns mean diagnostics."""
+def ppo_update(ac, opt, batch, epochs=10, minibatches=8, clip=0.2, vf_coef=0.5, ent_coef=0.0, max_grad=0.5, target_kl=0.03,
+               anchor=None):
+    """PPO update on a batch dict (obs, act, logp, adv, ret). Returns mean diagnostics.
+    anchor = (ref, mask, coef): on the states where mask(obs) is True, add coef * KL between the reference policy's
+    action distribution (ref(obs) -> mean, same std) and the current one, so a fine-tune keeps an old skill there."""
     n = batch["obs"].shape[0]
     mb = n // minibatches
-    stats = dict(pg=0.0, vf=0.0, ent=0.0, kl=0.0, clipfrac=0.0, steps=0)
+    stats = dict(pg=0.0, vf=0.0, ent=0.0, kl=0.0, clipfrac=0.0, anchor=0.0, steps=0)
     for _ in range(epochs):
         perm = torch.randperm(n, device=batch["obs"].device)
         for i in range(minibatches):
@@ -78,6 +81,17 @@ def ppo_update(ac, opt, batch, epochs=10, minibatches=8, clip=0.2, vf_coef=0.5, 
             vf = 0.5 * (v - batch["ret"][idx]).pow(2).mean()
             ent = d.entropy().sum(-1).mean()
             loss = pg + vf_coef * vf - ent_coef * ent
+            anc = torch.zeros((), device=loss.device)
+            if anchor is not None:
+                ref, mask, coef = anchor
+                obs_mb = batch["obs"][idx]
+                m = mask(obs_mb)
+                if m.any():
+                    with torch.no_grad():
+                        ref_mean = ref(obs_mb[m])
+                    std = ac.log_std.exp().detach()
+                    anc = 0.5 * (((d.mean[m] - ref_mean) / std) ** 2).sum(-1).mean()  # KL(ref || current), equal stds
+                    loss = loss + coef * anc
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(ac.parameters(), max_grad)
@@ -85,6 +99,7 @@ def ppo_update(ac, opt, batch, epochs=10, minibatches=8, clip=0.2, vf_coef=0.5, 
             with torch.no_grad():
                 kl = ((ratio - 1) - log_ratio).mean()  # approx KL(old || new)
                 stats["pg"] += pg.item(); stats["vf"] += vf.item(); stats["ent"] += ent.item(); stats["kl"] += kl.item()
+                stats["anchor"] += float(anc)
                 stats["clipfrac"] += ((ratio - 1).abs() > clip).float().mean().item(); stats["steps"] += 1
         if stats["kl"] / stats["steps"] > target_kl:  # moved too far from the data-collecting policy: stop
             break

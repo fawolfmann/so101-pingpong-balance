@@ -36,6 +36,8 @@ def bounce_kwargs(a) -> dict:
         kw.update(kick_z_min=a.kick_z_min, kick_z_max=a.kick_z_max, kick_z_frac=a.kick_z_frac)
     if getattr(a, "contact_damp", ""):
         kw["contact_damp"] = tuple(float(v) for v in a.contact_damp.split(","))
+    if getattr(a, "juggle_frac", 0.0) > 0 and getattr(a, "juggle_smooth", -1.0) >= 0:
+        kw["juggle_smooth"] = a.juggle_smooth
     return kw
 
 
@@ -100,6 +102,10 @@ def main():
     p.add_argument("--juggle-frac", type=float, default=0.0, help="--cam-policy: share of juggling episodes (adds the mode "
                    "input; sim/env.py JUGGLE_*); the rest are balance episodes")
     p.add_argument("--juggle-drop", default="0.08,0.15", help="juggling: drop height range above the resting ball, m")
+    p.add_argument("--juggle-smooth", type=float, default=-1.0, help="smoothness penalty in juggling episodes (sharp hits); "
+                   "< 0 = same as --smooth-penalty")
+    p.add_argument("--anchor-coef", type=float, default=0.0, help="with --init-from and --juggle-frac: keep the actions in "
+                   "balance episodes (mode 0) close to the starting policy (KL weight); 0 = off")
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
                    "the bouncing critic inputs gets zero weights for them)")
     p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std to this (0 = keep)")
@@ -155,6 +161,14 @@ def main():
             with torch.no_grad():
                 ac.log_std.fill_(float(np.log(a.init_std)))
         print(f"initialized from {a.init_from}", flush=True)
+    anchor = None
+    if getattr(a, "anchor_coef", 0.0) > 0 and getattr(a, "init_from", ""):
+        ref = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim).to(dev)
+        ref.load_state_dict(init_weights(a, env.obs_dim))
+        ref.requires_grad_(False)
+        mode_col = env.actor_dim - 1  # the mode input (1 juggling, 0 balance) is the actor's last input
+        anchor = (lambda o: ref.dist(o).mean, lambda o: o[:, mode_col] < 0.5, a.anchor_coef)
+        print(f"anchor: balance-episode actions kept close to {a.init_from} (coef {a.anchor_coef})", flush=True)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr, eps=1e-5)
     if ckpt:
         ac.load_state_dict(ckpt["model"])
@@ -222,7 +236,7 @@ def main():
             prm.requires_grad_(not warm)
         flat = lambda x: torch.as_tensor(x.reshape(T * N, *x.shape[2:]), device=dev)
         batch = dict(obs=flat(B["obs"]), act=flat(B["act"]), logp=flat(B["logp"]), adv=flat(adv), ret=flat(ret))
-        s = ppo_update(ac, opt, batch, ent_coef=a.ent_coef)
+        s = ppo_update(ac, opt, batch, ent_coef=a.ent_coef, anchor=anchor)
 
         # 4. logging
         row = dict(iter=it, steps=total, fps=int((total - total0) / (time.time() - t0)), std=float(ac.log_std.exp().mean().detach()), **s)

@@ -296,6 +296,71 @@ score is the time the ball stays juggled.
 - Watch for: hitting the ball needs fast paddle moves (action limit 0.04 rad per step, soft randomized servos) and a
   camera that follows a ball moving fast in the image (tracker distance fallback, `--track-gate`).
 
+### Juggling (iteration 2): what happened
+
+Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=True)` mode input, `eval_cam_policy
+--juggle`), fine-tuned from `cam_bounce`. Starting point: 0.9 s juggled on average, 0/90 to 30 s.
+
+| run | change | result (training, 10 s episodes) |
+|---|---|---|
+| v1 | 70% juggling + 30% balance, smoothness 0.3, -5 on a drop | balance 56 -> 32%, juggling flat 1.0 -> 1.6 s: forgetting |
+| v2 | + KL anchor to the bouncing policy on balance states, smoothness 0.05 when juggling, straight-hit bonus | balance held (43-48%), juggling 0.95 -> 1.34 s in 900 iterations; stalls 32 -> 55%: it learned to catch and hold |
+| v3 | no -5 in juggling episodes (a drop and a stall both just end the score) | stalls still rose; juggling flat ~1.6 s |
+| juggle-only | 100% juggling, no anchor, std 0.15 | 1.2 -> 2.9 s, 2.2 -> 7.2 bounces in 300 iterations |
+
+- The arm can juggle physically: a scripted hit sends the ball 27-30 cm up. The hard part is precision (the scripted
+  hitter always dropped it 10-23 cm to the side): soft, straight hits.
+- **Two tasks in one network was the obstacle**, not juggling: the same start learned 3x faster alone. The anchor kept
+  balancing but also pulled juggling toward "catch and settle"; a one-number mode input is a weak task signal.
+- Reward pitfall: with -5 for a drop and nothing for a stall, holding the ball was the safe choice. The score is the time
+  juggled, so a drop and a stall must cost the same.
+
+### Multi-task: one network for several skills
+
+Why one network struggles with two tasks, and what is known to work (multi-task RL literature):
+
+1. **Conflicting gradients**: the tasks' updates push shared weights in opposite directions. PCGrad removes the
+   conflicting component of each task's gradient before the update (Yu et al. 2020, arXiv:2001.06782).
+2. **Different reward scales**: the task with larger returns dominates learning. PopArt normalises values and advantages
+   per task (Hessel et al. 2019, arXiv:1809.04474). Cheapest version here: normalise advantages per task (not over the
+   mixed batch) and give each task its own value head.
+3. **Weak task conditioning**: one mode input among ~50. Stronger: per-task output heads, FiLM (the task scales/shifts
+   every hidden layer), soft modularization (Yang et al. 2020, arXiv:2003.13661). Gains over a plain task ID are modest
+   on Meta-World and vary between papers.
+4. **Train separately, then combine** (the most reliable here): policy distillation trains one expert per task with
+   RL, then a single network by supervised learning to copy each expert on its own task (Rusu et al. 2015,
+   arXiv:1511.06295). Distral does it during RL: task policies kept close to a shared distilled one (Teh et al. 2017,
+   arXiv:1707.04175). The KL anchor above was a one-sided version of this.
+
+**Plan: distillation, DAgger style.**
+1. Experts: balancing = `cam_bounce` (exists); juggling = the juggle-only policy (training).
+2. Student: one actor with the mode input, same size as now (later: the MoE below).
+3. Loop: run the *student* in both kinds of episode (simulated detections, all the randomization); label every state
+   with the matching expert's action (mode 0 -> balancing expert, 1 -> juggling expert); train the student by regression
+   on all states collected so far (MSE on the action mean, or KL with the experts' std). Running the student, not the
+   experts, matters: it collects the states the student itself drifts into, so it learns to recover from its own
+   mistakes (DAgger, Ross et al. 2011). Mix in some expert-driven rollouts at the start.
+4. Check: each mode's evaluation vs its expert (balance: sideways and upward-kick tests; juggling: time juggled).
+5. Optional PPO fine-tune of the student with per-task advantage normalisation, per-task value heads, PCGrad.
+Supervised, fast, and no reward interference between the tasks.
+
+**Idea: a mixture of experts (MoE) policy, to keep adding tasks.**
+- Actor = K expert MLPs + a gate. The gate (small MLP on the task input, optionally the state) outputs weights over the
+  experts; the action is the weighted sum of the experts' outputs (soft), or the top-1 expert (hard).
+- Why: a new task gets a new expert; the old experts can be frozen, so old skills cannot be forgotten, and the gate
+  learns when to use which. With a state-dependent soft gate, experts can be shared across tasks (a "catch the falling
+  ball" expert used by both bouncing and juggling).
+- Training: (a) distil the current experts into the MoE (each expert initialised from or distilled toward one task
+  expert, the gate trained on the mode); (b) a new task: add an expert, freeze the rest, train the new expert and the
+  gate (RL, then distil). Usual MoE care: a load-balancing term so one expert does not take every input, and a little
+  noise in the gate early on.
+- Related work: soft modularization (routing over modules, arXiv:2003.13661), mixture of orthogonal experts (MOORE,
+  arXiv:2311.11385), parameter-compositional multi-task RL (PaCo, arXiv:2210.11653), progressive networks (frozen
+  columns per task with lateral connections; Rusu et al. 2016).
+- Cost: K x the actor (still tiny: K = 4 experts of 2 x 256 ~ 4 x 80k parameters, microseconds on the robot computer).
+  Start with hard routing by task (= separate policies behind one interface), then soft, state-dependent gating once
+  there are tasks that share skills.
+
 ## 2. PPO → GRPO
 
 Keep the ball task, so PPO's 97.5% is the target to compare against.
