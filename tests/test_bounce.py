@@ -78,3 +78,42 @@ def test_bounce_training_starts_from_the_same_policy():
     env = CamPolicyEnv(height_info=True, contact_damp=(30.0, 30.0))
     o, _ = env.reset(seed=1)
     assert o.shape == (f1,) and env.obs_dim == a0
+
+
+def test_juggling_counts_bounces_and_stops_a_held_ball():
+    from sim.env import CONTROL_HZ, JUGGLE_STALL_S
+    env = BalanceEnv(grip_rot_deg=-90, contact_damp=(30.0, 30.0), max_steps=150)
+    env.reset(seed=0, options={"juggle": True, "drop": 0.10})
+    assert env.kicks == {} and env.juggle
+    rewards, info = [], {}
+    for _ in range(150):
+        _, r, term, trunc, info = env.step(np.zeros(5))
+        rewards.append(r)
+        if term or trunc:
+            break
+    assert info["n_bounces"] >= 1 and info["apex_mean"] >= 0.03  # the free bounces after the drop count
+    assert info["stalled"] or info["fell"]  # a still arm cannot keep it going
+    assert len(rewards) <= (JUGGLE_STALL_S + 1.5) * CONTROL_HZ
+    plain = BalanceEnv(grip_rot_deg=-90)
+    plain.reset(seed=0)
+    assert not plain.juggle and "n_bounces" not in plain.step(np.zeros(5))[4]
+
+
+def test_juggling_starts_from_the_bouncing_policy():
+    from sim.cam_policy_env import CamPolicyEnv, expand_for_juggle, obs_dims
+    from sim.ppo import ActorCritic
+    a0, f0 = obs_dims(3, 3, height_info=True)
+    a1, f1 = obs_dims(3, 3, height_info=True, juggle=True)
+    base = ActorCritic(f0, 7, actor_dim=a0)
+    new = ActorCritic(f1, 7, actor_dim=a1)
+    new.load_state_dict(expand_for_juggle(base.state_dict(), 3, 3))
+    old = torch.randn(4, f0)
+    obs = torch.cat([old[:, :a0], torch.ones(4, 1), old[:, a0:], torch.rand(4, 1)], dim=1)  # mode = 1, any since-bounce
+    with torch.no_grad():
+        assert torch.allclose(new.dist(obs).mean, base.dist(old).mean)
+        assert torch.allclose(new.value(obs), base.value(old))
+    env = CamPolicyEnv(height_info=True, juggle=True, juggle_frac=1.0, contact_damp=(30.0, 30.0))
+    o, _ = env.reset(seed=2)
+    assert o.shape == (f1,) and o[a1 - 1] == 1.0 and env.env.juggle
+    o, _ = env.reset(seed=2, juggle=False)
+    assert o[a1 - 1] == 0.0 and not env.env.juggle

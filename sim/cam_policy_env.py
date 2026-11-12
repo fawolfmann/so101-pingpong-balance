@@ -9,6 +9,9 @@ Observation (actor part, all available on the real robot), newest first:
 Critic-only extra (appended): true ball (u, w, vu, vw) in controller units, true projection (4), camera mounting offset
 (7, scaled), latency / 4; height_info=True (bouncing): + ball height above its resting position / 0.1 m and velocity
 along the blade normal / 1 m/s. The actor is the same either way.
+juggle=True: the actor gets one more input last, the mode (1 = juggling episode, 0 = balance), and the critic one more
+last, the time since the last counted bounce (s). A juggle_frac share of the episodes juggle (ball dropped from
+juggle_drop m, sim/env.py JUGGLE_*); the rest are the usual balance episodes.
 Action: [0:5] joint deltas as BalanceEnv; [5:7] pan/tilt rate, x CAM_TRACK_RATE rad per step. The camera command goes
 through the same latency as the arm.
 
@@ -30,10 +33,27 @@ EGO_HW = (192, 256)
 N_PRIV = 16
 
 
-def obs_dims(frames: int, act_hist: int, height_info: bool = False) -> tuple[int, int]:
+def obs_dims(frames: int, act_hist: int, height_info: bool = False, juggle: bool = False) -> tuple[int, int]:
     """(actor obs size, actor + critic-only obs size)."""
-    a = 6 * frames + 10 + 7 * act_hist
-    return a, a + N_PRIV + 2 * int(height_info)
+    a = 6 * frames + 10 + 7 * act_hist + int(juggle)
+    return a, a + N_PRIV + 2 * int(height_info) + int(juggle)
+
+
+def expand_for_juggle(sd: dict, frames: int, act_hist: int) -> dict:
+    """A bouncing checkpoint (height_info, no mode) -> one with juggle=True: zero weights for the mode input (actor and
+    critic) and the time-since-bounce input (critic), so the expanded policy acts exactly like the bouncing one."""
+    a0, f0 = obs_dims(frames, act_hist, height_info=True)
+    a1, f1 = obs_dims(frames, act_hist, height_info=True, juggle=True)
+    out = dict(sd)
+    for net, n_old, n_new, idx in (("actor", a0, a1, np.arange(a0)),
+                                   ("critic", f0, f1, np.r_[np.arange(a0), np.arange(a0, f0) + 1])):
+        w = sd[f"{net}.0.weight"]
+        if w.shape[1] != n_old:
+            raise ValueError(f"{net} has {w.shape[1]} inputs, expected {n_old}")
+        nw = w.new_zeros((w.shape[0], n_new))
+        nw[:, idx] = w
+        out[f"{net}.0.weight"] = nw
+    return out
 
 
 def expand_critic(sd: dict, frames: int, act_hist: int) -> dict:
@@ -50,7 +70,8 @@ class CamPolicyEnv:
     act_dim = 7
 
     def __init__(self, render: bool = False, frames: int = 3, act_hist: int = 3, cam_smooth: float = 0.05,
-                 det_noise: DetNoise | None = None, height_info: bool = False, track_gate: float = 0.0, **env_kw):
+                 det_noise: DetNoise | None = None, height_info: bool = False, track_gate: float = 0.0,
+                 juggle: bool = False, juggle_frac: float = 0.0, juggle_drop: tuple[float, float] = (0.08, 0.15), **env_kw):
         self.render, self.frames, self.act_hist, self.cam_smooth = render, frames, act_hist, cam_smooth
         self.noise = det_noise if det_noise is not None else DetNoise.load()
         env_kw.setdefault("grip_rot_deg", -90.0)
@@ -59,8 +80,10 @@ class CamPolicyEnv:
             self.env = BalanceEnv(obs_mode="image", camera="ego", cam_track=True, image_hw=EGO_HW, light_model=False, **env_kw)
         else:
             self.env = BalanceEnv(obs_mode="controller", camera="ego", cam_track=True, image_hw=EGO_HW, **env_kw)
-        self.height_info = height_info
-        self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info)
+        self.height_info, self.juggle, self.juggle_frac, self.juggle_drop = height_info, juggle, juggle_frac, tuple(juggle_drop)
+        if juggle_frac > 0 and not juggle:
+            raise ValueError("juggling episodes need juggle=True (the policy must be told the mode)")
+        self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info, juggle)
         self.detector = BallDetector(track=True, hw=EGO_HW, gate=track_gate)
         self.rng = np.random.default_rng()
 
@@ -88,15 +111,23 @@ class CamPolicyEnv:
     def _obs(self) -> np.ndarray:
         e = self.env
         c = e.controller_obs()  # BalanceEnv built without ball_noise: [0:4] is the true ball state
-        actor = np.concatenate([np.ravel(self._dets), np.ravel(self._aims), c[4:14], np.ravel(self._acts)])
+        mode = [float(e.juggle)] if self.juggle else []
+        actor = np.concatenate([np.ravel(self._dets), np.ravel(self._aims), c[4:14], np.ravel(self._acts), mode])
         priv = np.concatenate([c[:4], project(e), e.cam_features(), [e._action_delay / 4]])
         if self.height_info:
             lift, vn = e.ball_lift()
             priv = np.r_[priv, lift / 0.1, vn]
+        if self.juggle:
+            priv = np.r_[priv, e.since_bounce()]
         return np.concatenate([actor, priv]).astype(np.float32)
 
-    def reset(self, seed: int | None = None):
-        obs, info = self.env.reset(seed=seed)
+    def reset(self, seed: int | None = None, juggle: bool | None = None):
+        """juggle: force a juggling (True) or balance (False) episode; None = drawn with juggle_frac."""
+        mode = np.random.default_rng(None if seed is None else [seed, 0x7A])
+        if juggle is None:
+            juggle = self.juggle and mode.uniform() < self.juggle_frac
+        opts = dict(juggle=True, drop=float(mode.uniform(*self.juggle_drop))) if juggle else {}
+        obs, info = self.env.reset(seed=seed, options=opts)
         self.rng = np.random.default_rng(None if seed is None else [seed, 0xCA])
         self._ep = self.noise.new_episode(self.rng)
         self.detector.reset()

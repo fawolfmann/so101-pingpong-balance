@@ -40,8 +40,10 @@ def bounce_kwargs(a) -> dict:
 
 
 def cam_bounce_kwargs(a) -> dict:
-    """--cam-policy extras for bouncing: the critic's height inputs and the tracker's distance fallback."""
+    """--cam-policy extras for bouncing / juggling: the critic's height inputs, the mode input, the tracker fallback."""
     kw = dict(height_info=True) if bounce_kwargs(a) else {}
+    if getattr(a, "juggle_frac", 0.0) > 0:
+        kw.update(juggle=True, juggle_frac=a.juggle_frac, juggle_drop=tuple(float(v) for v in a.juggle_drop.split(",")))
     if getattr(a, "track_gate", 0.0) > 0:
         kw["track_gate"] = a.track_gate
     return kw
@@ -50,6 +52,9 @@ def cam_bounce_kwargs(a) -> dict:
 def init_weights(a, critic_dim: int) -> dict:
     """--init-from: the checkpoint's weights; a --cam-policy one without the height inputs gets zero weights for them."""
     sd = torch.load(a.init_from, map_location="cpu", weights_only=True)["model"]
+    if getattr(a, "juggle_frac", 0.0) > 0 and sd["critic.0.weight"].shape[1] + 2 == critic_dim:
+        from sim.cam_policy_env import expand_for_juggle  # bouncing checkpoint -> + mode and time-since-bounce inputs
+        return expand_for_juggle(sd, a.frames, a.act_hist)
     if sd["critic.0.weight"].shape[1] + 2 == critic_dim and getattr(a, "cam_policy", False):
         from sim.cam_policy_env import expand_critic
         sd = expand_critic(sd, a.frames, a.act_hist)
@@ -92,6 +97,9 @@ def main():
     p.add_argument("--contact-damp", default="", help="elastic ball/blade contact, damping range 'lo,hi' per episode "
                    "(sim/env.py BOUNCE_STIFF: 20 -> restitution ~0.86, 40 -> ~0.75); empty = the original dead contact")
     p.add_argument("--track-gate", type=float, default=0.0, help="--cam-policy: tracker distance fallback, image units")
+    p.add_argument("--juggle-frac", type=float, default=0.0, help="--cam-policy: share of juggling episodes (adds the mode "
+                   "input; sim/env.py JUGGLE_*); the rest are balance episodes")
+    p.add_argument("--juggle-drop", default="0.08,0.15", help="juggling: drop height range above the resting ball, m")
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
                    "the bouncing critic inputs gets zero weights for them)")
     p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std to this (0 = keep)")
@@ -222,12 +230,21 @@ def main():
         row.update(ep_return=nan, ep_len=nan, success=nan, **{f"success_lat{L}": nan for L in range(a.max_latency + 1)})
         if getattr(a, "kick_z_max", 0.0) > 0:
             row.update(success_upkick=nan, success_sidekick=nan)
+        if getattr(a, "juggle_frac", 0.0) > 0:
+            row.update(juggle_s=nan, juggle_bounces=nan, juggle_stalled=nan, success_balance=nan)
         if recent:
             row.update(ep_return=float(np.mean([e["ret"] for e in recent])), ep_len=float(np.mean([e["length"] for e in recent])),
                        success=float(np.mean([e["success"] for e in recent])))
             for L in range(a.max_latency + 1):
                 es = [e["success"] for e in recent if e["latency"] == L]
                 row[f"success_lat{L}"] = float(np.mean(es)) if es else float("nan")
+            if getattr(a, "juggle_frac", 0.0) > 0:
+                js = [e for e in recent if e.get("juggle")]
+                row["juggle_s"] = float(np.mean([e["juggle_s"] for e in js])) if js else float("nan")
+                row["juggle_bounces"] = float(np.mean([e["n_bounces"] for e in js])) if js else float("nan")
+                row["juggle_stalled"] = float(np.mean([e["stalled"] for e in js])) if js else float("nan")
+                bs = [e["success"] for e in recent if not e.get("juggle")]
+                row["success_balance"] = float(np.mean(bs)) if bs else float("nan")
             if getattr(a, "kick_z_max", 0.0) > 0:
                 for name, z in (("success_upkick", True), ("success_sidekick", False)):
                     es = [e["success"] for e in recent if e.get("kick_z", False) == z]
@@ -243,7 +260,9 @@ def main():
                   f"succ {row.get('success', float('nan')):.2f} ({' '.join(f'lat{L} {row.get(f'success_lat{L}', float('nan')):.2f}' for L in range(a.max_latency + 1))}) "
                   f"| kl {s['kl']:.4f} clip {s['clipfrac']:.2f} std {row['std']:.2f}"
                   + (f" | up-kick {row['success_upkick']:.2f} side-kick {row['success_sidekick']:.2f}"
-                     if getattr(a, "kick_z_max", 0.0) > 0 else ""), flush=True)
+                     if getattr(a, "kick_z_max", 0.0) > 0 else "")
+                  + (f" | juggle {row['juggle_s']:.1f} s {row['juggle_bounces']:.1f} bounces stall {row['juggle_stalled']:.2f}"
+                     f" balance {row['success_balance']:.2f}" if getattr(a, "juggle_frac", 0.0) > 0 else ""), flush=True)
 
         # 5. checkpoints
         if it % a.save_every == 0 or it == a.iters:
