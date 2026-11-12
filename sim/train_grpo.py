@@ -24,7 +24,7 @@ import torch
 from sim.env import CONTROL_HZ
 from sim.grpo import group_advantages, grpo_update
 from sim.ppo import ActorCritic
-from sim.train_controller import save
+from sim.train_controller import bounce_kwargs, cam_bounce_kwargs, init_weights, save
 from sim.vec_env import EpisodicVecEnv
 
 OUT = Path(__file__).parent.parent / "outputs" / "controller"
@@ -58,6 +58,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kick-max", type=float, default=0.0)
     p.add_argument("--kick-every", type=float, default=4.0)
     p.add_argument("--kick-margin", type=float, default=1.0)
+    # arm + camera policy, bouncing, juggling: same flags as train_controller.py
+    p.add_argument("--cam-policy", action="store_true")
+    p.add_argument("--frames", type=int, default=3)
+    p.add_argument("--cam-smooth", type=float, default=0.05)
+    p.add_argument("--kick-z-min", type=float, default=0.0)
+    p.add_argument("--kick-z-max", type=float, default=0.0)
+    p.add_argument("--kick-z-frac", type=float, default=1.0)
+    p.add_argument("--contact-damp", default="")
+    p.add_argument("--track-gate", type=float, default=0.0)
+    p.add_argument("--juggle-frac", type=float, default=0.0)
+    p.add_argument("--juggle-drop", default="0.08,0.15")
+    p.add_argument("--juggle-smooth", type=float, default=-1.0)
+    p.add_argument("--init-from", default="", help="start from this checkpoint's weights")
+    p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std (0 = keep)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
@@ -96,9 +110,17 @@ def main() -> None:
                          act_hist=a.act_hist, grip_rot_deg=a.grip_rot, home_penalty=a.home_penalty, servo_rand=a.servo_rand,
                          ball_noise=a.ball_noise, max_steps=round(a.episode_s * CONTROL_HZ), kick_min=a.kick_min,
                          kick_max=a.kick_max, kick_every=a.kick_every, kick_margin=a.kick_margin,
-                         smooth_penalty=a.smooth_penalty)
+                         smooth_penalty=a.smooth_penalty, **bounce_kwargs(a),
+                         **(dict(cam_policy=True, frames=a.frames, cam_smooth=a.cam_smooth, cam_rand=0.3, **cam_bounce_kwargs(a))
+                            if a.cam_policy else {}))
     G, P = a.group_size, env.n_envs // a.group_size
-    ac = ActorCritic(env.obs_dim, env.act_dim)
+    ac = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim)
+    if a.init_from:
+        ac.load_state_dict(init_weights(a, env.obs_dim))
+        if a.init_std > 0:
+            with torch.no_grad():
+                ac.log_std.fill_(float(np.log(a.init_std)))
+        print(f"initialized from {a.init_from}", flush=True)
     opt = torch.optim.Adam(list(ac.actor.parameters()) + [ac.log_std], lr=a.lr, eps=1e-5)
     ref = copy.deepcopy(ac).eval() if a.kl_coef > 0 else None
     budget = a.total_steps or float("inf")
@@ -129,13 +151,20 @@ def main() -> None:
             for L in range(a.max_latency + 1):
                 es = [r["success"] for r in recent if r["latency"] == L]
                 row[f"success_lat{L}"] = float(np.mean(es)) if es else float("nan")
+            js = [r for r in recent if r.get("juggle")]
+            if a.juggle_frac > 0:
+                row.update(juggle_s=float(np.mean([r["juggle_s"] for r in js])) if js else float("nan"),
+                           juggle_bounces=float(np.mean([r["n_bounces"] for r in js])) if js else float("nan"),
+                           juggle_stalled=float(np.mean([r["stalled"] for r in js])) if js else float("nan"))
             if writer is None:
                 writer = csv.DictWriter(csv_f, fieldnames=list(row)); writer.writeheader()
             writer.writerow(row); csv_f.flush()
             if it % 10 == 0 or it == 1:
                 print(f"it {it:5d} steps {total / 1e6:6.2f}M fps {row['fps']:5d} | ret {row['ep_return']:6.1f} "
                       f"len {row['ep_len']:5.0f} succ {row['success']:.2f} | kl {s['kl']:.4f} clip {s['clipfrac']:.2f} "
-                      f"std {row['std']:.2f} no-signal groups {no_signal:.2f}", flush=True)
+                      f"std {row['std']:.2f} no-signal groups {no_signal:.2f}"
+                      + (f" | juggle {row['juggle_s']:.1f} s {row['juggle_bounces']:.1f} bounces stall {row['juggle_stalled']:.2f}"
+                         if a.juggle_frac > 0 else ""), flush=True)
             done = total >= budget or it == max_iters
             if it % a.save_every == 0 or done:
                 ck = dict(model=ac.state_dict(), args=vars(a), iter=it, steps=total)

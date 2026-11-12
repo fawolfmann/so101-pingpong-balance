@@ -361,6 +361,42 @@ Supervised, fast, and no reward interference between the tasks.
   Start with hard routing by task (= separate policies behind one interface), then soft, state-dependent gating once
   there are tasks that share skills.
 
+### Goal: play ping pong (several tasks, one robot)
+
+Balancing, bouncing and juggling are the first steps toward playing table tennis. A game is a sequence of distinct
+skills, which is why the multi-task work (distillation, mixture of experts) matters: each skill can be an expert, and a
+gate (or a high-level policy) picks the skill from the game state.
+
+**The skills in a rally**, roughly in the order to build them:
+
+| skill | what it needs | builds on |
+|---|---|---|
+| control the ball on the paddle | done: balance, catch upward kicks | — |
+| juggle | done (in progress): repeated straight hits, time in the air | catching |
+| aimed hit | send the ball to a target point (direction + height), not only straight up | juggling |
+| receive / return | hit an incoming ball (thrown or launched) back over a net to a target region | aimed hit, tracking a fast ball |
+| serve | toss the ball off the paddle, then hit it so it bounces on our side, over the net, then on theirs | juggling + aimed hit |
+| rally | return repeatedly; recover to a ready pose between hits | receive, positioning |
+| game | serve/receive rules, scoring, an opponent (a ball launcher, a scripted opponent, or self-play) | all of the above |
+
+**What the simulation needs**, beyond what exists:
+- A table and a net (and the ITTF bounce: the ball must bounce on the table), placed within the arm's reach — likely a
+  scaled-down table for the SO-101's ~40 cm reach.
+- An incoming ball: a launcher with random speed, direction and spin, for receiving; later an opponent.
+- Ball flight physics: air drag and the Magnus force from spin (MuJoCo has no aerodynamics for a sphere by default;
+  add them as forces each step), and spin transfer at paddle and table contacts (rubber friction).
+- Perception for a fast ball over the whole table: the post camera may not cover it; a second camera, or one higher and
+  further back; 30 Hz may be too slow for a returned ball (~3-6 m/s) - check exposure and motion blur on the real camera.
+- Timing: a hit has to happen at the right moment, so latency matters more than for balancing (see "Real arm: latency").
+
+**Hardware limits to check early**: the SO-101's joint speeds and torques (can it swing a paddle fast enough for a
+return?), reach, and the paddle mount. A slower game (lighter returns, a mini table) may be the realistic target.
+
+**How to train it**: one expert per skill (RL, each with its own reward), distilled DAgger-style into one policy with a
+skill input, or a mixture of experts with a gate driven by the game phase; possibly a high-level policy choosing the
+skill (hierarchical RL). Each new skill = a new expert, old ones frozen. Evaluate every skill on its own test, and the
+whole game on rallies completed.
+
 ## 2. PPO → GRPO
 
 Keep the ball task, so PPO's 97.5% is the target to compare against.

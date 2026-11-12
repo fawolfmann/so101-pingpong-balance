@@ -113,9 +113,7 @@ class VecBalanceEnv:
 def _episodic_worker(conn, env_kwargs, n_envs):
     """Like _worker, but resets with given seeds and never auto-resets: a finished env returns its last obs, reward 0
     and done=True until the next reset."""
-    from sim.env import BalanceEnv
-
-    envs = [BalanceEnv(obs_mode="controller", **env_kwargs) for _ in range(n_envs)]
+    envs = [make_train_env(env_kwargs) for _ in range(n_envs)]  # BalanceEnv, or the arm + camera env (cam_policy=True)
     done = np.zeros(n_envs, bool)
     res: list[dict] = [{} for _ in envs]
     last = [None] * n_envs
@@ -126,7 +124,8 @@ def _episodic_worker(conn, env_kwargs, n_envs):
             for i, (e, s) in enumerate(zip(envs, data)):
                 o, _ = e.reset(seed=int(s))
                 obs.append(o); last[i] = o
-                kicks.append(tuple((t, round(float(v[0]), 9), round(float(v[1]), 9)) for t, v in sorted(e.kicks.items())))
+                base = getattr(e, "env", e)
+                kicks.append(tuple((t, *(round(float(x), 9) for x in v)) for t, v in sorted(base.kicks.items())))
                 res[i] = dict(seed=int(s), ret=0.0, length=0, success=False, latency=e._action_delay)
             done[:] = False
             conn.send((np.stack(obs), kicks))
@@ -140,7 +139,9 @@ def _episodic_worker(conn, env_kwargs, n_envs):
                 res[i]["ret"] += r; res[i]["length"] += 1
                 if te or tr:
                     done[i] = True
-                    res[i].update(success=bool(info["is_success"]), dropped=bool(info["fell"] or info["bad_qacc"]))
+                    res[i].update(success=bool(info["is_success"]), dropped=bool(info["fell"] or info["bad_qacc"]),
+                                  juggle=bool(info.get("juggle", False)), juggle_s=info.get("juggle_s", 0.0),
+                                  n_bounces=info.get("n_bounces", 0), stalled=bool(info.get("stalled", False)))
                 obs.append(o); rew.append(r); last[i] = o
             conn.send((np.stack(obs), np.array(rew, np.float32), done.copy()))
         elif cmd == "results":
@@ -164,7 +165,7 @@ class EpisodicVecEnv:
             p = ctx.Process(target=_episodic_worker, args=(child, env_kwargs, envs_per_worker), daemon=True)
             p.start(); child.close()
             self.conns.append(parent); self.procs.append(p)
-        self.obs_dim, self.act_dim = 14 + 5 * env_kwargs.get("act_hist", 1), 5
+        self.obs_dim, self.actor_dim, self.act_dim = env_dims(env_kwargs)
 
     def _chunks(self, x):
         return [x[i * self.per:(i + 1) * self.per] for i in range(len(self.conns))]
