@@ -19,7 +19,7 @@ def make_train_env(env_kwargs):
     if kw.pop("cam_policy", False):
         from sim.cam_policy_env import CamPolicyEnv
         return CamPolicyEnv(**kw)
-    for k in ("frames", "cam_smooth", "height_info", "track_gate", "juggle", "juggle_frac", "juggle_drop"):
+    for k in ("frames", "cam_smooth", "height_info", "track_gate", "juggle", "juggle_frac", "juggle_drop", "cam_track_w"):
         kw.pop(k, None)
     from sim.env import BalanceEnv
     return BalanceEnv(obs_mode="controller", **kw)
@@ -30,7 +30,7 @@ def env_dims(env_kwargs) -> tuple[int, int, int]:
     if env_kwargs.get("cam_policy"):
         from sim.cam_policy_env import obs_dims
         actor, full = obs_dims(env_kwargs.get("frames", 3), env_kwargs.get("act_hist", 1), env_kwargs.get("height_info", False),
-                               env_kwargs.get("juggle", False))
+                               env_kwargs.get("juggle", False), env_kwargs.get("juggle_target") is not None)
         return full, actor, 7
     d = 14 + 5 * env_kwargs.get("act_hist", 1)
     return d, d, 5
@@ -58,7 +58,9 @@ def _worker(conn, env_kwargs, seeds):
                     eps.append(dict(ret=ret[i], length=int(length[i]), success=bool(info["is_success"]), latency=e._action_delay,
                                     kick_z=bool(info.get("kick_z", False)), juggle=bool(info.get("juggle", False)),
                                     juggle_s=info.get("juggle_s", 0.0), n_bounces=info.get("n_bounces", 0),
-                                    stalled=bool(info.get("stalled", False))))
+                                    stalled=bool(info.get("stalled", False)), jitter=info.get("jitter_between", float("nan")),
+                                    tilt=info.get("hit_tilt_deg", float("nan")), apex_std=info.get("apex_std", float("nan")),
+                                    target_err=info.get("target_err", float("nan"))))
                     ret[i], length[i] = 0.0, 0
                     o, _ = e.reset()
                 obs.append(o); rew.append(r); term.append(te); trunc.append(tr); final.append(fo)

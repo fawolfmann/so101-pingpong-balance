@@ -33,10 +33,28 @@ EGO_HW = (192, 256)
 N_PRIV = 16
 
 
-def obs_dims(frames: int, act_hist: int, height_info: bool = False, juggle: bool = False) -> tuple[int, int]:
+def obs_dims(frames: int, act_hist: int, height_info: bool = False, juggle: bool = False,
+             height_cmd: bool = False) -> tuple[int, int]:
     """(actor obs size, actor + critic-only obs size)."""
-    a = 6 * frames + 10 + 7 * act_hist + int(juggle)
+    a = 6 * frames + 10 + 7 * act_hist + int(juggle) + int(height_cmd)
     return a, a + N_PRIV + 2 * int(height_info) + int(juggle)
+
+
+def expand_for_height_cmd(sd: dict, frames: int, act_hist: int) -> dict:
+    """A juggling checkpoint (mode input, no height command) -> one with the height command as the actor's last input:
+    zero weights for it in the actor and the critic, so the expanded policy acts exactly like the juggling one."""
+    a0, f0 = obs_dims(frames, act_hist, height_info=True, juggle=True)
+    a1, f1 = obs_dims(frames, act_hist, height_info=True, juggle=True, height_cmd=True)
+    out = dict(sd)
+    for net, n_old, n_new, idx in (("actor", a0, a1, np.arange(a0)),
+                                   ("critic", f0, f1, np.r_[np.arange(a0), np.arange(a0, f0) + 1])):
+        w = sd[f"{net}.0.weight"]
+        if w.shape[1] != n_old:
+            raise ValueError(f"{net} has {w.shape[1]} inputs, expected {n_old}")
+        nw = w.new_zeros((w.shape[0], n_new))
+        nw[:, idx] = w
+        out[f"{net}.0.weight"] = nw
+    return out
 
 
 def expand_for_juggle(sd: dict, frames: int, act_hist: int) -> dict:
@@ -71,7 +89,8 @@ class CamPolicyEnv:
 
     def __init__(self, render: bool = False, frames: int = 3, act_hist: int = 3, cam_smooth: float = 0.05,
                  det_noise: DetNoise | None = None, height_info: bool = False, track_gate: float = 0.0,
-                 juggle: bool = False, juggle_frac: float = 0.0, juggle_drop: tuple[float, float] = (0.08, 0.15), **env_kw):
+                 juggle: bool = False, juggle_frac: float = 0.0, juggle_drop: tuple[float, float] = (0.08, 0.15),
+                 cam_track_w: float = 0.0, **env_kw):
         self.render, self.frames, self.act_hist, self.cam_smooth = render, frames, act_hist, cam_smooth
         self.noise = det_noise if det_noise is not None else DetNoise.load()
         env_kw.setdefault("grip_rot_deg", -90.0)
@@ -83,7 +102,9 @@ class CamPolicyEnv:
         self.height_info, self.juggle, self.juggle_frac, self.juggle_drop = height_info, juggle, juggle_frac, tuple(juggle_drop)
         if juggle_frac > 0 and not juggle:
             raise ValueError("juggling episodes need juggle=True (the policy must be told the mode)")
-        self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info, juggle)
+        self.height_cmd = env_kw.get("juggle_target") is not None  # the commanded bounce height is an actor input
+        self.cam_track_w = cam_track_w  # reward for keeping the ball near the image centre (true projection, training only)
+        self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info, juggle, self.height_cmd)
         self.detector = BallDetector(track=True, hw=EGO_HW, gate=track_gate)
         self.rng = np.random.default_rng()
 
@@ -112,6 +133,8 @@ class CamPolicyEnv:
         e = self.env
         c = e.controller_obs()  # BalanceEnv built without ball_noise: [0:4] is the true ball state
         mode = [float(e.juggle)] if self.juggle else []
+        if self.height_cmd:
+            mode = mode + [e.target_apex / 0.2 if e.juggle else 0.0]
         actor = np.concatenate([np.ravel(self._dets), np.ravel(self._aims), c[4:14], np.ravel(self._acts), mode])
         priv = np.concatenate([c[:4], project(e), e.cam_features(), [e._action_delay / 4]])
         if self.height_info:
@@ -148,6 +171,10 @@ class CamPolicyEnv:
         aim0 = e._aim.copy()
         obs, r, te, tr, info = e.step(a[:5])
         r -= self.cam_smooth * float(np.sum((a[5:7] - self._prev_cam) ** 2))
+        if self.cam_track_w > 0:  # follow the ball: reward it near the image centre (where it really is, not the detection)
+            proj = project(e)
+            if proj[3]:
+                r += self.cam_track_w * (1.0 - min(float(np.hypot(proj[0], proj[1])) / 0.5, 1.0))
         self._prev_cam = a[5:7]
         det = self._detect(obs, e._aim - aim0)  # the servo encoders give the camera's turn
         self._dets = np.roll(self._dets, 1, axis=0); self._dets[0] = det

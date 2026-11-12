@@ -21,8 +21,10 @@ blade at the end. The reward is unchanged (centred, slow ball): catch it softly 
 Juggling (per episode: reset(options={"juggle": True, "drop": h})): the ball is dropped from h above its resting
 position, no kicks, and the task is to keep it bouncing. A bounce counts when its flight peaks >= JUGGLE_MIN_APEX above
 the resting position; the ball is juggled while the last counted bounce (or the drop) is under JUGGLE_STALL_S old.
-Reward per step: 1 while juggled + JUGGLE_CENTRE_W * centring - the smoothness (juggle_smooth: sharp hits allowed) and
-home penalties, + a straight-hit bonus at each counted bounce (largest when it peaks over the centre); the episode ends on
+Reward per step: 1 while juggled + JUGGLE_CENTRE_W * centring - the home penalty, + a straight-hit bonus at each counted
+bounce (largest when it peaks over the centre) and at each impact (blade level, moving straight up). Smoothness: the
+full smooth_penalty and a joint-acceleration penalty everywhere except the hit window (ball within HIT_WINDOW_LIFT of
+the blade), where only juggle_smooth applies: one clean move at the hit, no shaking in between. The episode ends on
 a drop or a stall (no counted bounce for JUGGLE_STALL_S: holding the ball earns nothing), with no extra penalty for
 either: the score is the time juggled. Success: juggled to the end.
 """
@@ -64,6 +66,13 @@ JUGGLE_MIN_APEX = 0.03  # m above the resting position: a smaller hop is not a b
 JUGGLE_STALL_S = 1.0  # s without a counted bounce: stalled
 JUGGLE_CENTRE_W = 0.2  # centring shaping in juggling episodes
 JUGGLE_STRAIGHT_W, JUGGLE_STRAIGHT_SIGMA = 1.0, 0.03  # bonus per counted bounce: W * exp(-(offset at the apex / SIGMA)^2)
+# Height command (juggle_target=(lo, hi)): a target apex height, redrawn every 1-3 counted bounces; bonus per bounce
+HEIGHT_W, HEIGHT_SIGMA = 1.5, 0.025  # W * exp(-((apex - target) / SIGMA)^2), m
+# Clean hits: smooth everywhere except a short window around each contact, and a reward for a level, vertical hit.
+HIT_WINDOW_LIFT = 0.035  # m: the ball this close to the blade = the hit window (juggle_smooth applies; else smooth_penalty)
+JUGGLE_ACC_W = 0.05  # outside the window: reward -= W * sum((joint velocity change per step, rad/s)^2): no shaking
+HIT_LEVEL_W, HIT_LEVEL_SIGMA = 0.5, np.deg2rad(5.0)  # at each ball/blade impact: blade normal close to vertical
+HIT_LATERAL_W, HIT_LATERAL_SIGMA = 0.5, 0.1  # ... and blade moving straight up (sideways speed, m/s)
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
 
@@ -137,7 +146,10 @@ class BalanceEnv(gym.Env):
         kick_z_max: float = 0.0,
         kick_z_frac: float = 1.0,  # share of the episodes whose kicks get the upward component
         contact_damp: tuple[float, float] | None = None,  # elastic ball/blade contact, damping drawn per episode
-        juggle_smooth: float | None = None,  # smoothness penalty in juggling episodes (None: smooth_penalty)
+        juggle_smooth: float | None = None,  # smoothness penalty in the hit window of juggling episodes (None: smooth_penalty)
+        juggle_calm: float | None = None,  # smoothness penalty between hits in juggling episodes (None: smooth_penalty)
+        juggle_acc: float = JUGGLE_ACC_W,  # joint-acceleration penalty between hits in juggling episodes
+        juggle_target: tuple[float, float] | None = None,  # juggling: commanded apex height range (m), redrawn every 1-3 bounces
         seed: int | None = None,
     ):
         if not 0.0 <= kick_min <= kick_max:
@@ -159,7 +171,9 @@ class BalanceEnv(gym.Env):
         self.airborne_ok = kick_z_max > 0 or contact_damp is not None  # the ball may leave the blade
         self.kick_z_on = False  # this episode's kicks have an upward component
         self.juggle = False  # this episode is a juggling episode (reset option)
-        self.juggle_smooth = juggle_smooth
+        self.juggle_smooth, self.juggle_calm, self.juggle_acc = juggle_smooth, juggle_calm, juggle_acc
+        self.juggle_target = tuple(juggle_target) if juggle_target is not None else None
+        self.target_apex = 0.0  # the commanded apex height of the next bounce (0 = none)
 
         self.grip_rot_deg = grip_rot_deg
         # wrist roll compensates the grip rotation, so the blade has the same world pose
@@ -369,6 +383,10 @@ class BalanceEnv(gym.Env):
         if self.juggle:  # the bouncing is the task: no kicks; the drop counts as the first bounce
             self.kicks, self.kick_z_on = {}, False
             self.n_bounces, self._last_bounce, self._vz_prev, self._apexes, self._apex_offsets = 0, 0, 0.0, [], []
+            self._target_errs = []
+            self._new_target()
+            self._impacts, self._jit_between, self._touching = [], [], False  # dropped from above: not touching yet
+            self._qd_prev = self.d.qvel[self.v_adr].copy()
         if self.cam_track:  # start aimed at the blade centre (known from the arm's kinematics)
             self._aim, self._aim_want = self._yaw_pitch(self._parent_dir(self.d.geom_xpos[self.blade_geom])), None
             self._apply_aim()
@@ -438,8 +456,11 @@ class BalanceEnv(gym.Env):
         a_applied = self._delay_buf.pop(0)
         self._q_target = np.clip(self._q_target + a_applied * self.action_scale, self.q_lo, self.q_hi)
         self.d.ctrl[self.act_ids] = self._q_target
+        impact = None
         for _ in range(self.n_substeps):
             mujoco.mj_step(self.m, self.d)
+            if self.juggle and impact is None:
+                impact = self._impact()
         self.t += 1
         if self.cam_track and self._aim_want is not None:
             self._aim = self._aim + np.clip(self._aim_want - self._aim, -CAM_TRACK_RATE, CAM_TRACK_RATE)
@@ -453,8 +474,22 @@ class BalanceEnv(gym.Env):
         if self.juggle:  # 1 per step while juggled (the return is the time juggled), light centring, straight hits
             juggled, straight = self._count_bounce(dist)
             reward = float(juggled) + JUGGLE_CENTRE_W * centre + straight
-            if self.juggle_smooth is not None:
-                smooth = self.juggle_smooth  # hitting needs quick moves
+            if impact is not None:  # a clean hit: blade level and moving straight up when the ball lands on it
+                tilt, lateral = impact
+                reward += HIT_LEVEL_W * float(np.exp(-(tilt / HIT_LEVEL_SIGMA) ** 2))
+                reward += HIT_LATERAL_W * float(np.exp(-(lateral / HIT_LATERAL_SIGMA) ** 2))
+                self._impacts.append(impact)
+            qd = self.d.qvel[self.v_adr].copy()
+            in_window = self.ball_lift()[0] < HIT_WINDOW_LIFT
+            if in_window:
+                if self.juggle_smooth is not None:
+                    smooth = self.juggle_smooth  # the hit: one quick move allowed
+            else:  # between hits: smooth, and no shaking
+                if self.juggle_calm is not None:
+                    smooth = self.juggle_calm
+                reward -= self.juggle_acc * float(np.sum((qd - self._qd_prev) ** 2))
+                self._jit_between.append(float(np.abs(a - self._prev_action).mean()))
+            self._qd_prev = qd
         else:  # reward (true ball state): near the centre, slow ball
             reward = centre - 0.05 * speed
         reward -= smooth * float(np.sum((a - self._prev_action) ** 2))
@@ -482,12 +517,42 @@ class BalanceEnv(gym.Env):
             success = bool(truncated and not terminated)
             extra = dict(stalled=bool(stalled), n_bounces=self.n_bounces, juggle_s=self.t / CONTROL_HZ,
                          apex_mean=float(np.mean(self._apexes)) if self._apexes else float("nan"),
-                         apex_offset=float(np.mean(self._apex_offsets)) if self._apex_offsets else float("nan"))
+                         apex_offset=float(np.mean(self._apex_offsets)) if self._apex_offsets else float("nan"),
+                         apex_std=float(np.std(self._apexes)) if len(self._apexes) > 1 else float("nan"),
+                         target_err=float(np.mean(np.abs(self._target_errs))) if self._target_errs else float("nan"),
+                         hit_tilt_deg=float(np.rad2deg(np.mean([i[0] for i in self._impacts]))) if self._impacts else float("nan"),
+                         hit_lateral=float(np.mean([i[1] for i in self._impacts])) if self._impacts else float("nan"),
+                         jitter_between=float(np.mean(self._jit_between)) if self._jit_between else float("nan"))
         else:
             success = bool(truncated and not terminated and dist < self.success_radius and on_blade)
             extra = {}
         return self._obs(), float(reward), terminated, truncated, self._info(dist=dist, fell=bool(fell), bad_qacc=bad,
                                                                             is_success=success, **extra)
+
+    def _impact(self):
+        """Juggling, once per substep: on the first substep of a new ball/blade contact, the blade's tilt from level (rad)
+        and its sideways speed (m/s); None otherwise."""
+        d, n = self.d, self.d.ncon
+        g1, g2 = d.contact.geom1[:n], d.contact.geom2[:n]
+        b, p = self.ball_geom, self.blade_geom
+        touching = bool(np.any(((g1 == b) & (g2 == p)) | ((g1 == p) & (g2 == b))))
+        new = touching and not self._touching
+        self._touching = touching
+        if not new:
+            return None
+        normal = d.geom_xmat[p].reshape(3, 3)[:, 2]
+        tilt = float(np.arccos(np.clip(abs(normal[2]), 0.0, 1.0)))
+        vel = np.zeros(6)
+        mujoco.mj_objectVelocity(self.m, d, mujoco.mjtObj.mjOBJ_GEOM, p, vel, 0)
+        return tilt, float(np.hypot(vel[3], vel[4]))
+
+    def _new_target(self) -> None:
+        """Juggling with a height command: a new target apex height, held for 1-3 counted bounces."""
+        if self.juggle_target is None:
+            self.target_apex = 0.0
+            return
+        self.target_apex = float(self.rng.uniform(*self.juggle_target))
+        self._target_left = int(self.rng.integers(1, 4))
 
     def _count_bounce(self, dist: float) -> tuple[bool, float]:
         """Juggling: at the top of each flight (vertical velocity turns negative, ball off the blade), count a bounce if
@@ -502,6 +567,12 @@ class BalanceEnv(gym.Env):
             self._apexes.append(lift)
             self._apex_offsets.append(dist)
             bonus = JUGGLE_STRAIGHT_W * float(np.exp(-(dist / JUGGLE_STRAIGHT_SIGMA) ** 2))
+            if self.juggle_target is not None:  # how close the bounce came to the commanded height
+                self._target_errs.append(lift - self.target_apex)
+                bonus += HEIGHT_W * float(np.exp(-((lift - self.target_apex) / HEIGHT_SIGMA) ** 2))
+                self._target_left -= 1
+                if self._target_left <= 0:
+                    self._new_target()
         self._vz_prev = vz
         return self.t - self._last_bounce <= round(JUGGLE_STALL_S * CONTROL_HZ), bonus
 

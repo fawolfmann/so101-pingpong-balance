@@ -117,3 +117,22 @@ def test_juggling_starts_from_the_bouncing_policy():
     assert o.shape == (f1,) and o[a1 - 1] == 1.0 and env.env.juggle
     o, _ = env.reset(seed=2, juggle=False)
     assert o[a1 - 1] == 0.0 and not env.env.juggle
+
+
+def test_height_command_starts_from_the_juggling_policy():
+    from sim.cam_policy_env import CamPolicyEnv, expand_for_height_cmd, obs_dims
+    from sim.ppo import ActorCritic
+    a0, f0 = obs_dims(3, 3, height_info=True, juggle=True)
+    a1, f1 = obs_dims(3, 3, height_info=True, juggle=True, height_cmd=True)
+    base, new = ActorCritic(f0, 7, actor_dim=a0), ActorCritic(f1, 7, actor_dim=a1)
+    new.load_state_dict(expand_for_height_cmd(base.state_dict(), 3, 3))
+    old = torch.randn(4, f0)
+    obs = torch.cat([old[:, :a0], torch.rand(4, 1), old[:, a0:]], dim=1)  # any commanded height
+    with torch.no_grad():
+        assert torch.allclose(new.dist(obs).mean, base.dist(old).mean)
+        assert torch.allclose(new.value(obs), base.value(old))
+    env = CamPolicyEnv(height_info=True, juggle=True, juggle_frac=1.0, contact_damp=(30.0, 30.0),
+                       juggle_target=(0.04, 0.2), cam_track_w=0.3)
+    o, _ = env.reset(seed=3)
+    assert o.shape == (f1,) and 0.2 <= o[a1 - 1] <= 1.0  # target / 0.2 for a 4-20 cm command
+    assert 0.04 <= env.env.target_apex <= 0.2

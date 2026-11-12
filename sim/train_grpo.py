@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--juggle-frac", type=float, default=0.0)
     p.add_argument("--juggle-drop", default="0.08,0.15")
     p.add_argument("--juggle-smooth", type=float, default=-1.0)
+    p.add_argument("--juggle-calm", type=float, default=-1.0)
+    p.add_argument("--juggle-acc", type=float, default=0.05)
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights")
     p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std (0 = keep)")
     p.add_argument("--save-every", type=int, default=50)

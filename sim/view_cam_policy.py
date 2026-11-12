@@ -4,6 +4,8 @@
     uv run mjpython -m sim.view_cam_policy --nudge 2.5 --latency 2 --seconds 15
     uv run mjpython -m sim.view_cam_policy --policy outputs/controller/cam_bounce/best.pt --nudge 2.5 --nudge-up 0.5,1.5
         # bouncing: every push also kicks the ball up (m/s); the contact is elastic when the policy was trained with it
+    uv run mjpython -m sim.view_cam_policy --policy outputs/controller/juggle_only/last.pt --juggle --seconds 30
+        # juggling: the ball is dropped onto the paddle; the policy keeps it bouncing (bounces counted on screen)
 
 Every step: render the camera -> whole-ball candidates -> tracker -> policy -> 5 joint moves + pan/tilt. On screen:
   inset (bottom left)  the camera image; green ring = ball seen, yellow = tracker coasting on its prediction
@@ -51,6 +53,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--nudge-up", default="", help="upward speed range added to every push, 'lo,hi' m/s")
     p.add_argument("--contact-damp", default="", help="elastic contact damping 'lo,hi' (default: the policy's training value)")
+    p.add_argument("--juggle", action="store_true", help="juggling episodes (policy trained with --juggle-frac)")
     a = p.parse_args()
     if not Path(a.policy).exists():
         raise SystemExit(f"missing checkpoint {a.policy}")
@@ -61,6 +64,9 @@ def main() -> None:
     env = CamPolicyEnv(render=True, frames=ta.get("frames", 3), act_hist=ta["act_hist"], domain_rand=True, servo_rand=True,
                        cam_rand=0.3, max_latency=max(a.latency, 1), max_steps=round(a.seconds * CONTROL_HZ),
                        track_gate=ta.get("track_gate", 0.0),
+                       **(dict(juggle=True, height_info=True) if ta.get("juggle_frac", 0.0) > 0 else {}),
+                       **(dict(juggle_target=tuple(float(v) for v in ta["juggle_target"].split(",")))
+                          if ta.get("juggle_target") else {}),
                        **(dict(contact_damp=tuple(float(v) for v in damp.split(","))) if damp else {}))
     if up:
         env.env.airborne_ok = True
@@ -69,7 +75,7 @@ def main() -> None:
     every = round(a.nudge * CONTROL_HZ) if a.nudge > 0 else 0
 
     def reset(seed: int):
-        obs, _ = env.reset(seed=seed)
+        obs, _ = env.reset(seed=seed, **(dict(juggle=True) if a.juggle else {}))
         e._action_delay, e._delay_buf, env._cam_buf = a.latency, [np.zeros(5)] * a.latency, [np.zeros(2)] * a.latency
         return obs
 
@@ -83,7 +89,7 @@ def main() -> None:
         while v.is_running():
             t0 = time.time()
             act = controller_action(ac, obs[:ac.actor_dim])
-            if end_step is None and every and e.t > 0 and e.t % every == 0:
+            if end_step is None and every and not a.juggle and e.t > 0 and e.t % every == 0:
                 ang = rng.uniform(0, 2 * np.pi)
                 vz = rng.uniform(*up) if up else 0.0
                 e.d.qvel[e.ball_vadr:e.ball_vadr + 3] += np.r_[0.25 * np.cos(ang), 0.25 * np.sin(ang), vz]
@@ -102,6 +108,11 @@ def main() -> None:
                 v.set_images((mujoco.MjrRect(vp.left + 10, vp.bottom + 10, ins.shape[1], ins.shape[0]), ins))
             aim = np.rad2deg(e._aim - e._aim0)
             state = "seen" if det[3] else ("coasting" if det[2] > 0 else "lost")
+            if a.juggle:
+                state += f"   |   bounces {e.n_bounces}, last {1000 * e.since_bounce():.0f} ms ago"
+                if e.juggle_target is not None:
+                    last = f"{100 * e._apexes[-1]:.0f} cm" if e._apexes else "-"
+                    state += f"   |   target height {100 * e.target_apex:.0f} cm, last bounce {last}"
             v.set_texts([(mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT,
                           "policy\nepisode\nstatus\ntime\nball\npan / tilt\ncam command\nballs kept",
                           f"{Path(a.policy).parent.name}/{Path(a.policy).name}\n{episodes + 1} (latency {a.latency})\n{status}\n"
@@ -111,7 +122,11 @@ def main() -> None:
 
             if end_step is None and (te or tr):
                 episodes += 1; balanced += int(info["is_success"])
-                status = "balanced" if info["is_success"] else f"DROPPED at {e.t / CONTROL_HZ:.1f} s"
+                if a.juggle:
+                    how = "time up" if info["is_success"] else ("stalled" if info.get("stalled") else "dropped")
+                    status = f"juggled {info['juggle_s']:.1f} s, {info['n_bounces']} bounces ({how})"
+                else:
+                    status = "balanced" if info["is_success"] else f"DROPPED at {e.t / CONTROL_HZ:.1f} s"
                 print(f"episode {episodes}: {status} | {balanced}/{episodes}", flush=True)
                 end_step = e.t + round(AFTER_END_S * CONTROL_HZ)
             if end_step is not None and e.t >= end_step:
