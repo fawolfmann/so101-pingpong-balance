@@ -323,7 +323,8 @@ Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=Tru
 | juggle-only (2.5M steps) | 1/60 | 4.0 | 0.25 | 1.8 deg | - |
 | + 4M steps PPO (`juggle_ppo`) | 10/36 | 13.9 | 0.27 | 1.6 deg | - |
 | + clean-hit reward (`juggle_clean`) | **19/36** | **19.0** | 0.16 | 1.1 deg | 17.5 |
-| + camera following, reversal penalty, height command (`juggle_height`) | 16/36 | 18.0 | **0.15** | 1.3 deg | **8.9** |
+| + camera following, reversal penalty, height command (`juggle_height`) | 16/36 | 18.0 | **0.15** | 1.3 deg | 8.9 |
+| same reward, **from scratch** (`juggle_scratch`, 12.3M steps, start std 0.6) | 14/36 | 15.5 | 0.17 | 1.3 deg | **8.0** |
 
 - More steps help (PPO 4.1 -> 6 s in training). **PPO beat GRPO on juggling** at the same start and budget (5.2 vs 2.9 s
   at 1.5M steps): GRPO declined and its exploration collapsed (std 0.12 -> 0.07). Long episodes of very different
@@ -345,7 +346,10 @@ Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=Tru
      that loses all future reward. A short safe bounce is the real optimum of that reward.
   Next options: count a bounce only if it reaches its commanded height (the command then decides survival), a separate
   height-control expert, or (if variety is the goal, not control) reward the change in height between bounces.
-- A from-scratch policy with the same reward (`juggle_scratch`, start std 0.6) reached ~5 s juggled in 1500 iterations.
+- From scratch with the same reward (`juggle_scratch`, start std 0.6, 4000 iterations, 85 min) juggles almost as well
+  as the fine-tuned chain (14 vs 16/36 to 30 s) and **follows the ball with the camera far better**: mean ball offset
+  from the image centre 0.11 vs 0.38 (fine-tuned policies kept the wandering camera they started with). Same optimum
+  for the height command: ignored (correlation 0.00), as expected from the same reward.
 
 ### Multi-task: one network for several skills
 
