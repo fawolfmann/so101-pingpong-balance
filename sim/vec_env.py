@@ -19,7 +19,8 @@ def make_train_env(env_kwargs):
     if kw.pop("cam_policy", False):
         from sim.cam_policy_env import CamPolicyEnv
         return CamPolicyEnv(**kw)
-    kw.pop("frames", None); kw.pop("cam_smooth", None)
+    for k in ("frames", "cam_smooth", "height_info", "track_gate"):
+        kw.pop(k, None)
     from sim.env import BalanceEnv
     return BalanceEnv(obs_mode="controller", **kw)
 
@@ -28,7 +29,7 @@ def env_dims(env_kwargs) -> tuple[int, int, int]:
     """(obs size, actor obs size, action size) of make_train_env(env_kwargs)."""
     if env_kwargs.get("cam_policy"):
         from sim.cam_policy_env import obs_dims
-        actor, full = obs_dims(env_kwargs.get("frames", 3), env_kwargs.get("act_hist", 1))
+        actor, full = obs_dims(env_kwargs.get("frames", 3), env_kwargs.get("act_hist", 1), env_kwargs.get("height_info", False))
         return full, actor, 7
     d = 14 + 5 * env_kwargs.get("act_hist", 1)
     return d, d, 5
@@ -53,7 +54,8 @@ def _worker(conn, env_kwargs, seeds):
                 fo = np.zeros_like(o)
                 if te or tr:
                     fo = o
-                    eps.append(dict(ret=ret[i], length=int(length[i]), success=bool(info["is_success"]), latency=e._action_delay))
+                    eps.append(dict(ret=ret[i], length=int(length[i]), success=bool(info["is_success"]), latency=e._action_delay,
+                                    kick_z=bool(info.get("kick_z", False))))
                     ret[i], length[i] = 0.0, 0
                     o, _ = e.reset()
                 obs.append(o); rew.append(r); term.append(te); trunc.append(tr); final.append(fo)

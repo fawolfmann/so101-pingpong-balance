@@ -11,6 +11,12 @@ Kicks (off by default, kick_max > 0): mid-episode pushes that add a sideways vel
 in each kick_every-second window between kick_grace s after the start and kick_margin s before the end, speed uniform in
 [kick_min, kick_max] m/s, random direction. The schedule (self.kicks) is fixed at reset and comes from the reset seed
 alone, so episodes reset with the same seed get the same kicks whatever the policy does. The policy is not told.
+
+Bouncing (off by default): kick_z_max > 0 gives the kicks of a kick_z_frac share of the episodes an upward component,
+uniform in [kick_z_min, kick_z_max] m/s, so the ball flies off the paddle and bounces when it lands; contact_damp makes
+the ball/blade contact elastic (restitution ~0.75-0.86 instead of a dead ~0.1). With either on, the ball may be in the
+air: the episode ends if it falls past the blade, lands off it, or flies far away; success also needs it back on the
+blade at the end. The reward is unchanged (centred, slow ball): catch it softly and settle it.
 """
 from __future__ import annotations
 
@@ -43,12 +49,16 @@ CAM_TRACK_RATE = 0.2  # rad per control step (6 rad/s): pan/tilt servo speed lim
 CAM_AIM_LIMIT = np.array([0.6, 0.5])  # rad, pan/tilt range around the nominal aim (servo limits): covers the paddle's
 # whole workspace (blade centre ~0.33 rad below nominal), never reaches the post below the camera
 CAM_FEAT_SCALE = np.array([0.004, 0.004, 0.004, np.deg2rad(2.5), np.deg2rad(2.5), np.deg2rad(2.5), 4.0])  # pose offset -> ~unit
+# Elastic ball/blade contact, MuJoCo's direct form solref = (-stiffness, -damping). Drop tests on a still paddle:
+# damping 20 -> restitution e ~0.86, 30 -> ~0.80, 40 -> ~0.75 (the default solref "0.004 1": ~0.1, the ball lands dead).
+BOUNCE_STIFF = 40000.0
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
 
 def kick_schedule(rng: np.random.Generator, n_steps: int, every_s: float, grace_s: float, margin_s: float,
-                  speed: tuple[float, float]) -> dict[int, np.ndarray]:
-    """{step: (vx, vy) m/s}: one kick at a random step in each every_s window inside [grace_s, end - margin_s)."""
+                  speed: tuple[float, float], up: tuple[float, float] | None = None) -> dict[int, np.ndarray]:
+    """{step: (vx, vy) m/s}: one kick at a random step in each every_s window inside [grace_s, end - margin_s).
+    up = (lo, hi): each kick also gets an upward speed in that range, {step: (vx, vy, vz)}."""
     lo_speed, hi_speed = speed
     if every_s <= 0 or hi_speed <= 0:
         return {}
@@ -59,6 +69,8 @@ def kick_schedule(rng: np.random.Generator, n_steps: int, every_s: float, grace_
         t = int(rng.integers(lo, min(lo + window, stop)))
         ang, v = rng.uniform(0, 2 * np.pi), rng.uniform(lo_speed, hi_speed)
         kicks[t] = v * np.array([np.cos(ang), np.sin(ang)])
+        if up is not None:
+            kicks[t] = np.r_[kicks[t], rng.uniform(*up)]
     return kicks
 
 
@@ -109,6 +121,10 @@ class BalanceEnv(gym.Env):
         kick_every: float = 4.0,  # s, one kick per window of this length
         kick_grace: float = 1.0,  # s, no kick before this
         kick_margin: float = 1.0,  # s, no kick in the last this-many seconds (time to recover before the success check)
+        kick_z_min: float = 0.0,  # m/s, upward kick component range (bouncing, see module docstring); kick_z_max = 0: off
+        kick_z_max: float = 0.0,
+        kick_z_frac: float = 1.0,  # share of the episodes whose kicks get the upward component
+        contact_damp: tuple[float, float] | None = None,  # elastic ball/blade contact, damping drawn per episode
         seed: int | None = None,
     ):
         if not 0.0 <= kick_min <= kick_max:
@@ -126,6 +142,9 @@ class BalanceEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
         self.kick_speed, self.kick_every, self.kick_grace, self.kick_margin = (kick_min, kick_max), kick_every, kick_grace, kick_margin
         self.kicks: dict[int, np.ndarray] = {}
+        self.kick_z, self.kick_z_frac, self.contact_damp = (kick_z_min, kick_z_max), kick_z_frac, contact_damp
+        self.airborne_ok = kick_z_max > 0 or contact_damp is not None  # the ball may leave the blade
+        self.kick_z_on = False  # this episode's kicks have an upward component
 
         self.grip_rot_deg = grip_rot_deg
         # wrist roll compensates the grip rotation, so the blade has the same world pose
@@ -308,6 +327,8 @@ class BalanceEnv(gym.Env):
         if self.domain_rand:
             self._randomize()
         m, d, r = self.m, self.d, self.rng
+        if self.contact_damp is not None:
+            m.geom_solref[self.ball_geom] = m.geom_solref[self.blade_geom] = (-BOUNCE_STIFF, -r.uniform(*self.contact_damp))
         mujoco.mj_resetData(m, d)
         q0 = self.home_q + r.uniform(-0.03, 0.03, 5)
         d.qpos[self.q_adr] = q0
@@ -341,8 +362,10 @@ class BalanceEnv(gym.Env):
         if self.kick_speed[1] <= 0:
             return {}  # kicks off: draw nothing, so the main rng sequence is unchanged
         kseed = [seed, KICK_SEED_SALT] if seed is not None else [int(self.rng.integers(2**32)), KICK_SEED_SALT]
-        return kick_schedule(np.random.default_rng(kseed), self.max_steps, self.kick_every, self.kick_grace,
-                             self.kick_margin, self.kick_speed)
+        krng = np.random.default_rng(kseed)
+        self.kick_z_on = self.kick_z[1] > 0 and krng.uniform() < self.kick_z_frac  # no draw when off: old schedules unchanged
+        return kick_schedule(krng, self.max_steps, self.kick_every, self.kick_grace, self.kick_margin, self.kick_speed,
+                             up=self.kick_z if self.kick_z_on else None)
 
     # --- camera: mounting-error features (experiment: known camera pose) and ball tracking (pan/tilt) ---
     @staticmethod
@@ -387,7 +410,8 @@ class BalanceEnv(gym.Env):
 
     def step(self, action):
         if self.t in self.kicks:
-            self.d.qvel[self.ball_vadr:self.ball_vadr + 2] += self.kicks[self.t]
+            k = self.kicks[self.t]
+            self.d.qvel[self.ball_vadr:self.ball_vadr + len(k)] += k
         a = np.clip(np.asarray(action, np.float64), -1, 1)
         self._delay_buf.append(a)
         a_applied = self._delay_buf.pop(0)
@@ -412,13 +436,18 @@ class BalanceEnv(gym.Env):
             self._noisy_ball()
         self._prev_action = a
         self._hist = np.roll(self._hist, 1, axis=0); self._hist[0] = a
-        fell = dist > self.blade_radius - 0.5 * self.ball_radius or h < -0.01 or h > 0.08
+        edge = self.blade_radius - 0.5 * self.ball_radius
+        on_blade = h < self.rest_height() + 0.01
+        if self.airborne_ok:  # in the air is fine; fell past the blade, landed off it, or flew far away is not
+            fell = h < -0.01 or (dist > edge and on_blade) or dist > 0.2 or h > 0.5
+        else:
+            fell = dist > edge or h < -0.01 or h > 0.08
         bad = bool(self.d.warning[mujoco.mjtWarning.mjWARN_BADQACC].number)
         terminated = bool(fell or bad)
         if terminated:
             reward -= 5.0
         truncated = self.t >= self.max_steps
-        success = bool(truncated and not terminated and dist < self.success_radius)
+        success = bool(truncated and not terminated and dist < self.success_radius and on_blade)
         return self._obs(), float(reward), terminated, truncated, self._info(dist=dist, fell=bool(fell), bad_qacc=bad, is_success=success)
 
     def _render(self):
@@ -455,9 +484,19 @@ class BalanceEnv(gym.Env):
         p = np.array([u, w]) / self.blade_radius * b["gain"] + b["bias"] + b["ou"] + self.rng.normal(0, 1, 2) * BN_WHITE * b["k"]
         self._ball_obs = self._fd.update(p)
 
+    def rest_height(self) -> float:
+        """Ball centre above the blade centre plane when resting on it, m."""
+        return float(self.m.geom_size[self.blade_geom][1] + self.ball_radius)
+
+    def ball_lift(self) -> tuple[float, float]:
+        """Ball height above its resting position on the blade (m) and velocity along the blade normal (m/s)."""
+        _, _, h, _ = self.ball_in_blade()
+        n = self.blade_frame()[1]
+        return h - self.rest_height(), float(self.d.qvel[self.ball_vadr:self.ball_vadr + 3] @ n)
+
     def _info(self, **extra):
         u, w, h, speed = self.ball_in_blade()
-        return {"ball_u": u, "ball_w": w, "ball_h": h, "ball_speed": speed, **extra}
+        return {"ball_u": u, "ball_w": w, "ball_h": h, "ball_speed": speed, "kick_z": self.kick_z_on, **extra}
 
     def close(self):
         if self._renderer is not None:

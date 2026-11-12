@@ -29,6 +29,33 @@ def save(obj, path: Path):
     tmp.replace(path)
 
 
+def bounce_kwargs(a) -> dict:
+    """BalanceEnv settings for bouncing (empty when off, so older runs resume unchanged)."""
+    kw = {}
+    if getattr(a, "kick_z_max", 0.0) > 0:
+        kw.update(kick_z_min=a.kick_z_min, kick_z_max=a.kick_z_max, kick_z_frac=a.kick_z_frac)
+    if getattr(a, "contact_damp", ""):
+        kw["contact_damp"] = tuple(float(v) for v in a.contact_damp.split(","))
+    return kw
+
+
+def cam_bounce_kwargs(a) -> dict:
+    """--cam-policy extras for bouncing: the critic's height inputs and the tracker's distance fallback."""
+    kw = dict(height_info=True) if bounce_kwargs(a) else {}
+    if getattr(a, "track_gate", 0.0) > 0:
+        kw["track_gate"] = a.track_gate
+    return kw
+
+
+def init_weights(a, critic_dim: int) -> dict:
+    """--init-from: the checkpoint's weights; a --cam-policy one without the height inputs gets zero weights for them."""
+    sd = torch.load(a.init_from, map_location="cpu", weights_only=True)["model"]
+    if sd["critic.0.weight"].shape[1] + 2 == critic_dim and getattr(a, "cam_policy", False):
+        from sim.cam_policy_env import expand_critic
+        sd = expand_critic(sd, a.frames, a.act_hist)
+    return sd
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--name", default="controller_dev")
@@ -58,6 +85,16 @@ def main():
                    "simulated detections (sim/cam_policy_env.py); the critic also gets the true state")
     p.add_argument("--frames", type=int, default=3, help="--cam-policy: detection frames in the obs")
     p.add_argument("--cam-smooth", type=float, default=0.05, help="--cam-policy: reward -= this * sum((cam a - previous)^2)")
+    p.add_argument("--kick-z-min", type=float, default=0.0, help="bouncing: upward kick component range, m/s (0.5 -> ~1 cm "
+                   "hop, 1.5 -> ~11 cm); --kick-z-max 0 = off")
+    p.add_argument("--kick-z-max", type=float, default=0.0)
+    p.add_argument("--kick-z-frac", type=float, default=1.0, help="share of episodes with upward kicks (the rest: sideways only)")
+    p.add_argument("--contact-damp", default="", help="elastic ball/blade contact, damping range 'lo,hi' per episode "
+                   "(sim/env.py BOUNCE_STIFF: 20 -> restitution ~0.86, 40 -> ~0.75); empty = the original dead contact")
+    p.add_argument("--track-gate", type=float, default=0.0, help="--cam-policy: tracker distance fallback, image units")
+    p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
+                   "the bouncing critic inputs gets zero weights for them)")
+    p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std to this (0 = keep)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-entity", default=None, help="wandb username or team (needed if the account has no default entity)")
@@ -97,9 +134,17 @@ def main():
                         max_steps=round(getattr(a, "episode_s", 10.0) * 30), kick_min=getattr(a, "kick_min", 0.0),
                         kick_max=getattr(a, "kick_max", 0.0), kick_every=getattr(a, "kick_every", 4.0),
                         kick_margin=getattr(a, "kick_margin", 1.0), smooth_penalty=getattr(a, "smooth_penalty", 0.01),  # getattr: --resume of runs saved before these flags
-                        **(dict(cam_policy=True, frames=a.frames, cam_smooth=a.cam_smooth, cam_rand=0.3) if getattr(a, "cam_policy", False) else {}))
+                        **bounce_kwargs(a),
+                        **(dict(cam_policy=True, frames=a.frames, cam_smooth=a.cam_smooth, cam_rand=0.3,
+                                **cam_bounce_kwargs(a)) if getattr(a, "cam_policy", False) else {}))
     N, T = env.n_envs, a.steps
     ac = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim).to(dev)
+    if getattr(a, "init_from", "") and not ckpt:
+        ac.load_state_dict(init_weights(a, env.obs_dim))
+        if a.init_std > 0:
+            with torch.no_grad():
+                ac.log_std.fill_(float(np.log(a.init_std)))
+        print(f"initialized from {a.init_from}", flush=True)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr, eps=1e-5)
     if ckpt:
         ac.load_state_dict(ckpt["model"])
@@ -170,12 +215,18 @@ def main():
         row = dict(iter=it, steps=total, fps=int((total - total0) / (time.time() - t0)), std=float(ac.log_std.exp().mean().detach()), **s)
         nan = float("nan")  # every column exists from the first row, even before an episode has finished
         row.update(ep_return=nan, ep_len=nan, success=nan, **{f"success_lat{L}": nan for L in range(a.max_latency + 1)})
+        if getattr(a, "kick_z_max", 0.0) > 0:
+            row.update(success_upkick=nan, success_sidekick=nan)
         if recent:
             row.update(ep_return=float(np.mean([e["ret"] for e in recent])), ep_len=float(np.mean([e["length"] for e in recent])),
                        success=float(np.mean([e["success"] for e in recent])))
             for L in range(a.max_latency + 1):
                 es = [e["success"] for e in recent if e["latency"] == L]
                 row[f"success_lat{L}"] = float(np.mean(es)) if es else float("nan")
+            if getattr(a, "kick_z_max", 0.0) > 0:
+                for name, z in (("success_upkick", True), ("success_sidekick", False)):
+                    es = [e["success"] for e in recent if e.get("kick_z", False) == z]
+                    row[name] = float(np.mean(es)) if es else float("nan")
         if writer is None:
             writer = csv.DictWriter(csv_f, fieldnames=list(row)); writer.writeheader()
         writer.writerow(row); csv_f.flush()
@@ -185,7 +236,9 @@ def main():
             eta = (time.time() - t0) / (it - start_it) * (a.iters - it) / 60
             print(f"[{'#' * int(20 * it / a.iters):<20}] {100 * it / a.iters:3.0f}% eta {eta:4.0f} min | it {it:4d}/{a.iters} steps {total/1e6:5.2f}M fps {row['fps']:5d} | ret {row.get('ep_return', float('nan')):7.1f} len {row.get('ep_len', float('nan')):5.0f} "
                   f"succ {row.get('success', float('nan')):.2f} ({' '.join(f'lat{L} {row.get(f'success_lat{L}', float('nan')):.2f}' for L in range(a.max_latency + 1))}) "
-                  f"| kl {s['kl']:.4f} clip {s['clipfrac']:.2f} std {row['std']:.2f}", flush=True)
+                  f"| kl {s['kl']:.4f} clip {s['clipfrac']:.2f} std {row['std']:.2f}"
+                  + (f" | up-kick {row['success_upkick']:.2f} side-kick {row['success_sidekick']:.2f}"
+                     if getattr(a, "kick_z_max", 0.0) > 0 else ""), flush=True)
 
         # 5. checkpoints
         if it % a.save_every == 0 or it == a.iters:

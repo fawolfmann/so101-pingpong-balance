@@ -102,8 +102,11 @@ def iou(a: np.ndarray, b: np.ndarray) -> float:
 
 
 class BallTracker:
-    def __init__(self, hw: tuple[int, int] = (192, 256), iou_min: float = 0.05, grow: float = 2.0, max_coast: int = 5):
-        self.hw, self.iou_min, self.grow, self.max_coast = hw, iou_min, grow, max_coast
+    def __init__(self, hw: tuple[int, int] = (192, 256), iou_min: float = 0.05, grow: float = 2.0, max_coast: int = 5,
+                 gate: float = 0.0):
+        """gate > 0: with no overlapping candidate, still take the nearest one within this distance of the prediction
+        (image units). A bouncing ball reverses at each hit, where a constant-velocity prediction misses."""
+        self.hw, self.iou_min, self.grow, self.max_coast, self.gate = hw, iou_min, grow, max_coast, gate
         self.reset()
 
     def reset(self) -> None:
@@ -129,6 +132,11 @@ class BallTracker:
         pbox = box(np.array([*pred, self.r]), self.hw, self.grow)
         scores = [iou(pbox, box(c, self.hw, self.grow)) for c in cands]
         k = int(np.argmax(scores)) if scores else -1
+        if (k < 0 or scores[k] < self.iou_min) and self.gate > 0 and cands:
+            dists = [float(np.hypot(*(c[:2] - pred))) for c in cands]
+            k = int(np.argmin(dists)) if min(dists) <= self.gate else -1
+            if k >= 0:
+                scores[k] = self.iou_min  # accepted by distance
         if k >= 0 and scores[k] >= self.iou_min:
             c = cands[k]
             new = c[:2].astype(np.float64)
@@ -160,12 +168,12 @@ class BallDetector:
         det.reset()                                       # new episode
 
     track=False takes detect()'s keywords (min_area, max_area, s_min, select); track=True takes candidates()' keywords
-    (default TRACK_DET) and BallTracker's (iou_min, grow, max_coast). update(cands, shift) feeds the tracker candidates
+    (default TRACK_DET) and BallTracker's (iou_min, grow, max_coast, gate). update(cands, shift) feeds the tracker candidates
     from elsewhere (simulated detections in training)."""
 
     def __init__(self, track: bool = False, hw: tuple[int, int] = (192, 256), **kw):
         self.track = track
-        tk = {k: kw.pop(k) for k in ("iou_min", "grow", "max_coast") if k in kw}
+        tk = {k: kw.pop(k) for k in ("iou_min", "grow", "max_coast", "gate") if k in kw}
         self.kw = kw if (kw or not track) else dict(TRACK_DET)
         self.tracker = BallTracker(hw, **tk) if track else None
 
