@@ -18,6 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 hardware = ["lerobot[feetech]>=0.6.1,<0.7"]
 wandb = ["wandb>=0.20"]
+tensorboard = [
+    "tensorboard>=2.18",
+]
 
 [project.urls]
 Repository = "https://github.com/zecice/so101-pingpong-balance"

@@ -9,11 +9,13 @@ from sim.ppo import ActorCritic
 
 def load_controller(path) -> ActorCritic:
     ck = torch.load(path, map_location="cpu", weights_only=True)
-    obs_dim = next(v for k, v in ck["model"].items() if k.startswith("actor") and k.endswith("weight")).shape[1]
-    ac = ActorCritic(obs_dim)
-    ac.load_state_dict(ck["model"])
-    ac.act_hist = (obs_dim - 14) // 5  # the env must be built with this act_hist so controller_obs() has the right size
+    sd = ck["model"]
+    actor_dim, obs_dim = sd["actor.0.weight"].shape[1], sd["critic.0.weight"].shape[1]
+    ac = ActorCritic(obs_dim, sd["log_std"].shape[0], actor_dim=actor_dim)
+    ac.load_state_dict(sd)
     ac.train_args = ck.get("args", {})  # the env settings it was trained with (latency, servo randomization, ball noise, grip)
+    # the env must be built with this act_hist so controller_obs() has the right size
+    ac.act_hist = ac.train_args.get("act_hist", 3) if ac.train_args.get("cam_policy") else (obs_dim - 14) // 5
     return ac.eval()
 
 

@@ -1,0 +1,79 @@
+"""Evaluate an arm + camera policy (sim/cam_policy_env.py), by default with real rendering and the real detector.
+
+    uv run python -m sim.eval_cam_policy --policy outputs/controller/cam_policy/best.pt --latency 0,2,4 --episodes 30 --nudges 2
+    uv run python -m sim.eval_cam_policy --policy ... --sim-det      # simulated detections (what it was trained on)
+
+Same test as perception.estimator --eval: seeds 10000+i, servo and camera randomization, latency forced per row,
+--nudges pushes of 0.25 m/s at random steps. Also reports how the camera was used: detection rate, ball offset from
+the image centre, pan/tilt speed.
+"""
+from __future__ import annotations
+
+import argparse
+import multiprocessing as mp
+
+import numpy as np
+
+_G: dict = {}
+
+
+def _init(cfg):
+    import torch
+    from sim.cam_policy_env import CamPolicyEnv
+    from sim.policies import load_controller
+    torch.set_num_threads(1)
+    ac = load_controller(cfg["policy"])
+    ta = ac.train_args
+    _G.update(cfg=cfg, ac=ac, env=CamPolicyEnv(render=not cfg["sim_det"], frames=ta.get("frames", 3), act_hist=ta["act_hist"],
+                                              domain_rand=True, servo_rand=True, cam_rand=0.3, max_latency=cfg["max_lat"]))
+
+
+def _episode(job):
+    from sim.policies import controller_action
+    lat, seed = job
+    cfg, env, ac = _G["cfg"], _G["env"], _G["ac"]
+    obs, _ = env.reset(seed=seed)
+    env.env._action_delay, env.env._delay_buf, env._cam_buf = lat, [np.zeros(5)] * lat, [np.zeros(2)] * lat
+    rng = np.random.default_rng(seed + 777)  # the same nudges as perception.estimator's evaluation
+    nudges = {int(t): rng.uniform(0, 2 * np.pi) for t in rng.integers(30, 280, cfg["nudges"])}
+    seen, off, cam_speed = [], [], []
+    for t in range(env.max_steps):
+        a = controller_action(ac, obs[:ac.actor_dim])
+        if t in nudges:
+            env.env.d.qvel[env.env.ball_vadr:env.env.ball_vadr + 2] += 0.25 * np.array([np.cos(nudges[t]), np.sin(nudges[t])])
+        obs, _, te, tr, info = env.step(a)
+        det = info["det"]
+        seen.append(det[3]); cam_speed.append(np.abs(a[5:7]).max())
+        if det[3]:
+            off.append(np.abs(det[:2]).max())
+        if te or tr:
+            break
+    return dict(lat=lat, success=bool(info["is_success"]), length=t + 1, dist_mm=float(info["dist"] * 1000), seen=float(np.mean(seen)),
+                off=float(np.mean(off)) if off else 1.0, cam=float(np.mean(cam_speed)))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--policy", required=True)
+    p.add_argument("--latency", default="0,2,4")
+    p.add_argument("--episodes", type=int, default=30)
+    p.add_argument("--nudges", type=int, default=0)
+    p.add_argument("--sim-det", action="store_true", help="simulated detections instead of rendering")
+    p.add_argument("--workers", type=int, default=6)
+    a = p.parse_args()
+    lats = [int(v) for v in a.latency.split(",")]
+    jobs = [(lat, 10_000 + i) for lat in lats for i in range(a.episodes)]
+    cfg = dict(policy=a.policy, nudges=a.nudges, sim_det=a.sim_det, max_lat=max(lats))
+    with mp.get_context("spawn").Pool(a.workers, _init, (cfg,)) as pool:
+        res = pool.map(_episode, jobs, chunksize=1)
+    print(f"\n{a.policy} | {'simulated' if a.sim_det else 'rendered'} detections | {a.episodes} episodes per row | nudges {a.nudges}")
+    print(f"{'latency':>8} {'success':>9} {'len':>5} {'final dist':>11}  {'ball seen':>9} {'|offset|':>9} {'cam |a|':>8}")
+    for lat in lats + ([None] if len(lats) > 1 else []):
+        rs = [r for r in res if lat is None or r["lat"] == lat]
+        m = lambda k: np.mean([r[k] for r in rs])
+        print(f"{'all' if lat is None else lat:>8} {sum(r['success'] for r in rs):>4}/{len(rs):<4} {m('length'):5.0f} {m('dist_mm'):8.1f} mm"
+              f"  {m('seen'):9.3f} {m('off'):9.3f} {m('cam'):8.2f}")
+
+
+if __name__ == "__main__":
+    main()

@@ -13,10 +13,29 @@ import numpy as np
 from sim.ram import check_ram
 
 
-def _worker(conn, env_kwargs, seeds):
+def make_train_env(env_kwargs):
+    """BalanceEnv in controller mode, or with cam_policy=True the arm + camera env (sim/cam_policy_env.py)."""
+    kw = dict(env_kwargs)
+    if kw.pop("cam_policy", False):
+        from sim.cam_policy_env import CamPolicyEnv
+        return CamPolicyEnv(**kw)
+    kw.pop("frames", None); kw.pop("cam_smooth", None)
     from sim.env import BalanceEnv
+    return BalanceEnv(obs_mode="controller", **kw)
 
-    envs = [BalanceEnv(obs_mode="controller", **env_kwargs) for _ in seeds]
+
+def env_dims(env_kwargs) -> tuple[int, int, int]:
+    """(obs size, actor obs size, action size) of make_train_env(env_kwargs)."""
+    if env_kwargs.get("cam_policy"):
+        from sim.cam_policy_env import obs_dims
+        actor, full = obs_dims(env_kwargs.get("frames", 3), env_kwargs.get("act_hist", 1))
+        return full, actor, 7
+    d = 14 + 5 * env_kwargs.get("act_hist", 1)
+    return d, d, 5
+
+
+def _worker(conn, env_kwargs, seeds):
+    envs = [make_train_env(env_kwargs) for _ in seeds]
     ret = np.zeros(len(envs))
     length = np.zeros(len(envs), int)
     for e, s in zip(envs, seeds):
@@ -60,7 +79,7 @@ class VecBalanceEnv:
             self.conns.append(parent)
             self.procs.append(p)
         self.per = envs_per_worker
-        self.obs_dim, self.act_dim = 14 + 5 * env_kwargs.get("act_hist", 1), 5
+        self.obs_dim, self.actor_dim, self.act_dim = env_dims(env_kwargs)
 
     def reset(self):
         for c in self.conns:

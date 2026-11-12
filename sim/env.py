@@ -40,6 +40,8 @@ BN_A = float(np.exp(-1 / 60))
 FD_ALPHA = 0.5
 CONTROL_HZ = 30
 CAM_TRACK_RATE = 0.2  # rad per control step (6 rad/s): pan/tilt servo speed limit of the tracking camera
+CAM_AIM_LIMIT = np.array([0.6, 0.5])  # rad, pan/tilt range around the nominal aim (servo limits): covers the paddle's
+# whole workspace (blade centre ~0.33 rad below nominal), never reaches the post below the camera
 CAM_FEAT_SCALE = np.array([0.004, 0.004, 0.004, np.deg2rad(2.5), np.deg2rad(2.5), np.deg2rad(2.5), 4.0])  # pose offset -> ~unit
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
@@ -396,6 +398,7 @@ class BalanceEnv(gym.Env):
         self.t += 1
         if self.cam_track and self._aim_want is not None:
             self._aim = self._aim + np.clip(self._aim_want - self._aim, -CAM_TRACK_RATE, CAM_TRACK_RATE)
+            self._aim = np.clip(self._aim, self._aim0 - CAM_AIM_LIMIT, self._aim0 + CAM_AIM_LIMIT)
             self._apply_aim()
 
         u, w, h, speed = self.ball_in_blade()

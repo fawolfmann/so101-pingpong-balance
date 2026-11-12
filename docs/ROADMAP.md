@@ -177,6 +177,61 @@ uv run python -m perception.estimator --eval outputs/estimator/ego_dc.pt --contr
     --latency 0,2,4 --episodes 30 --servo-rand --nudges 2
 ```
 
+### One policy for the arm and the camera: results
+
+`sim/cam_policy_env.py`: one PPO policy with 7 actions (5 joint deltas + pan/tilt rates through the same latency)
+that sees the ball only through the camera: last 3 tracked detections, pan/tilt of those frames, joints, past actions.
+Asymmetric actor-critic: the critic also gets the true ball state, the true projection, the camera mount offset and the
+latency (training only). No estimator, no centring rule: the policy decides where to look.
+
+Training cannot render (PPO needs millions of steps), so detections are **simulated**: the ball is projected through
+the camera (`sim/cam_model.py`, true randomized pose and FOV) and given detector-like errors fitted against the
+renderer + detector (`sim/fit_cam_model.py`, 60k frames, the camera drifting off the ball to cover the image).
+Held out: detection rate 96.5 vs 96.5%, x error p50/p99 0.004/0.013 vs 0.004/0.011, y 0.008/0.022 vs 0.003/0.020
+(image units, -1..1). Simulated and rendered detections go through the same tracker
+(`perception.detector.BallDetector(track=True)`). Getting the fit to match needed three detector-side fixes, found
+by comparing the two:
+
+1. A ball cut by the image border is a sliver whose centre and size are wrong; the detector reported it.
+   `candidates()` keeps only whole balls: round (aspect <= 1.5, fills >= 55% of its circle), not touching the border.
+2. A small orange part at the arm base (~3 px radius vs the ball's 5-7.5 px): min area 60 px.
+3. The camera could tilt down at its own post (orange in some randomized episodes). Servo limits
+   `CAM_AIM_LIMIT` = ±0.6 rad pan, ±0.5 rad tilt around the nominal aim (the paddle is ~0.33 rad below it).
+   After these, detections with the ball out of view: 53% → 8.5% → 0%.
+
+The tracker (`BallTracker`) predicts the ball's image position (constant velocity + the shift of the camera's own
+turn, from its servos), keeps the candidate with the best box overlap (IoU), and coasts on the prediction
+(visible = 0) for up to 5 frames.
+
+Trained with the `ppo_kicks_smooth` recipe (latency 0-4, servo randomization, kicks up to 0.3 m/s every 2 s, 4 s
+episodes, smooth penalty 0.3), from scratch, stopped at 2000 iterations (6.1M steps, ~35 min); best checkpoint at
+1900 (96% training success). Same test as the table above (latency 0/2/4, 30 episodes each, 10 s):
+
+| | no nudges | 2 nudges | latency 4, 2 nudges |
+|---|---|---|---|
+| wrist estimator + controller | 81/90 | 69/90 | 24/30 |
+| ego_dc estimator + controller | 87/90 | 64/90 | 12-15/30 (all ego variants) |
+| ego_track (rule-steered camera) + estimator + controller | 83/90 | 68/90 | 12-15/30 |
+| **arm + camera policy, rendered** | **90/90** | **69/90** | **19/30** |
+| arm + camera policy, simulated detections | 88/90 | 62/90 | 14/30 |
+
+- Best camera result without nudges (90/90), level with the best with nudges; the weak spot is still latency 4 with
+  pushes, better than the ego estimators but behind the wrist camera.
+- Rendered evaluation is slightly *better* than simulated: the trained-on model misses 4.2% of in-view frames (the
+  rendered evaluation lost the ball in 0.6% of frames) and scales errors up to 1.5x per episode, so it errs on the
+  pessimistic side.
+- It does not centre the ball: the ball sits ~0.35 (image units) off centre and the camera moves little
+  (|pan/tilt command| ~0.1). Keeping the ball in view (99.4% of frames) is all balancing needs; looking ahead should
+  matter for bouncing.
+
+```bash
+uv run python -m sim.fit_cam_model --frames 60000                       # fit the detection model
+uv run python -m sim.train_controller --name cam_policy --cam-policy --act-hist 3 --grip-rot -90 --max-latency 4 \
+    --servo-rand --home-penalty 0.1 --smooth-penalty 0.3 --episode-s 4 --kick-max 0.3 --kick-every 2 --iters 2000
+uv run python -m sim.eval_cam_policy --policy outputs/controller/cam_policy/best.pt --latency 0,2,4 --episodes 30 --nudges 2
+uv run mjpython -m sim.view_cam_policy --nudge 2.5                     # watch it
+```
+
 ## 2. PPO → GRPO
 
 Keep the ball task, so PPO's 97.5% is the target to compare against.
@@ -246,3 +301,34 @@ A glass standing on a level tray is stable on its own, so a policy that does not
 - Full training took ~2 h on a Linux machine with a GPU (README). On a Mac it will be slower. For every change,
   start with a short run (`--iters 200`) and check that the reward goes up before committing to a full run.
 - On macOS the live viewer needs `mjpython`: `uv run mjpython -m sim.view_controller --rand --seconds 20`.
+- All experiments in one TensorBoard (training curves, estimator training, evaluations vs latency, stress tests,
+  results notes), rebuilt from the logs in `outputs/`:
+  `uv run --extra tensorboard python -m sim.to_tensorboard`, then
+  `uv run --extra tensorboard tensorboard --logdir outputs/tensorboard`.
+
+## Real arm: latency (to do when the arm arrives)
+
+In sim, **latency** = the whole control loop's delay in 33 ms steps (30 Hz): the action chosen now is applied N steps
+later (`BalanceEnv._action_delay`; the arm + camera policy delays its pan/tilt commands the same way). On the robot it
+is the sum of camera exposure + USB transfer, detection + policy, the servo bus, and the servo starting to move.
+How softly a servo then follows the command is separate (`servo_rand`: stiffness, damping, force limit).
+Training draws 0-4 steps per episode, so the policies cope with any fixed delay up to 133 ms without being told which;
+evaluations fix it per row. Latency 4 with pushes is the weak case for every setup (it acts on 133 ms old images).
+
+**Measure it** (`hardware/run_real.py` does not yet):
+1. Step test: command a small sudden joint move, timestamp the command and the first camera frame where the paddle
+   moves; ~20 repeats, mean and spread. That is the full loop delay.
+2. Per-stage timestamps every frame (capture, detection, policy, command sent, encoder read-back): where the time goes,
+   and whether it is steady or jumps.
+Divide by 33 ms. Above 4 steps the policies are outside their training range: retrain with a larger `--max-latency`.
+
+**Adapting to it**, simplest first:
+- a. Make it constant: pad every loop to a fixed total (e.g. always 2 steps). A known, steady delay is much easier than
+  a variable one. No retraining.
+- b. Tell the policy: the critic already gets the latency in training; give it to the actor too, and on the robot feed
+  the value measured live from the timestamps. One input, ~35 min retraining.
+- c. Let the policy infer it: longer history of its commands and the joint encoders, a recurrent network or a small
+  learned estimator of the delay (rapid motor adaptation, as on legged robots). Pays off if the delay changes during a
+  run, or for bouncing.
+Plan: measure; if steady, (a) padded to the measured value and compare with the evaluation row for that latency; if it
+jitters frame to frame (USB cameras can), (b) with live timestamps. (b) can be tried in sim before the arm arrives.
