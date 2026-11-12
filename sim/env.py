@@ -39,6 +39,10 @@ BN_WHITE = np.array([0.03, 0.06]) / 8
 BN_A = float(np.exp(-1 / 60))
 FD_ALPHA = 0.5
 CONTROL_HZ = 30
+CAM_TRACK_RATE = 0.2  # rad per control step (6 rad/s): pan/tilt servo speed limit of the tracking camera
+CAM_AIM_LIMIT = np.array([0.6, 0.5])  # rad, pan/tilt range around the nominal aim (servo limits): covers the paddle's
+# whole workspace (blade centre ~0.33 rad below nominal), never reaches the post below the camera
+CAM_FEAT_SCALE = np.array([0.004, 0.004, 0.004, np.deg2rad(2.5), np.deg2rad(2.5), np.deg2rad(2.5), 4.0])  # pose offset -> ~unit
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
 
@@ -83,6 +87,7 @@ class BalanceEnv(gym.Env):
         self,
         obs_mode: str = "controller",
         image_hw: tuple[int, int] = (96, 128),
+        camera: str = "wrist",  # model camera rendered in image mode: "wrist" (on the gripper) or "ego" (post on the base)
         max_steps: int = 300,  # 10 s
         action_scale: float = 0.04,  # rad per step at |a| = 1
         domain_rand: bool = False,
@@ -96,6 +101,7 @@ class BalanceEnv(gym.Env):
         smooth_penalty: float = 0.01,  # reward -= smooth_penalty * sum((a - previous a)^2): discourages jittery actions
         servo_rand: bool = False,  # randomize servo stiffness, damping and force limit
         cam_rand: float = 1.0,  # scale of the camera pose/FOV randomization
+        cam_track: bool = False,  # pan/tilt camera: track_detection() steers it toward the detected ball (speed-limited)
         ball_noise: float = 0.0,  # >0: controller sees estimator-like noisy positions + FdVel velocity (1 = measured error)
         act_hist: int = 1,  # past actions in the controller obs (covers commands still in flight under latency)
         kick_min: float = 0.0,  # m/s, kick speed range (see module docstring); kick_max = 0: no kicks
@@ -113,7 +119,7 @@ class BalanceEnv(gym.Env):
         self.ball_start_radius, self.ball_start_speed, self.success_radius = ball_start_radius, ball_start_speed, success_radius
         self.max_latency, self.act_hist = max_latency, act_hist
         self.home_penalty, self.servo_rand, self.ball_noise, self.cam_rand = home_penalty, servo_rand, ball_noise, cam_rand
-        self.smooth_penalty = smooth_penalty
+        self.smooth_penalty, self.cam_track = smooth_penalty, cam_track
         self._fd = FdVel()
         self._ball_obs = np.zeros(4)
         self._hist = np.zeros((act_hist, 5))
@@ -138,7 +144,7 @@ class BalanceEnv(gym.Env):
         self.ball_body, self.ball_geom = m.body("ball").id, m.geom("ball_geom").id
         self.blade_geom, self.grip_body = m.geom("paddle_blade").id, m.body("gripper").id
         self.floor_geom = m.geom("floor").id
-        self.cam_id = m.camera("wrist").id
+        self.cam_id = m.camera(camera).id
         self.blade_radius = float(m.geom_size[self.blade_geom][0])
         self.ball_radius = float(m.geom_size[self.ball_geom][0])
         jids = [m.joint(j).id for j in ARM_JOINTS]
@@ -152,6 +158,12 @@ class BalanceEnv(gym.Env):
             gain=m.actuator_gainprm[self.act_ids, 0].copy(), bias=m.actuator_biasprm[self.act_ids, :3].copy(), frc=m.actuator_forcerange[self.act_ids].copy(),
         )
         self._renderer = None
+        self._cam_dq = np.array([1.0, 0, 0, 0])  # mounting error rotation (randomized)
+        self._cam_feat = np.zeros(7)
+        R0 = np.zeros(9); mujoco.mju_quat2Mat(R0, self._nominal["cam_quat"])
+        self._aim0 = self._yaw_pitch(-R0.reshape(3, 3)[:, 2])  # nominal looking direction, in the camera's parent body
+        self._aim = self._aim0.copy()
+        self._aim_want = None
 
         h, w = image_hw
         if obs_mode == "controller":
@@ -216,6 +228,9 @@ class BalanceEnv(gym.Env):
         mujoco.mju_axisAngle2Quat(dq, r.normal(size=3) / 1.0, np.deg2rad(r.uniform(0, 2.5) * k))
         mujoco.mju_mulQuat(m.cam_quat[self.cam_id], n["cam_quat"], dq)
         m.cam_fovy[self.cam_id] = n["cam_fovy"] + r.uniform(-4, 4) * k
+        self._cam_dq = dq
+        rv = np.zeros(3); mujoco.mju_quat2Vel(rv, dq, 1.0)
+        self._cam_feat = np.r_[m.cam_pos[self.cam_id] - n["cam_pos"], rv, m.cam_fovy[self.cam_id] - n["cam_fovy"]] / CAM_FEAT_SCALE
         # ball colour, mass, friction; blade friction
         rgba = n["ball_rgba"].copy(); rgba[:3] = np.clip(rgba[:3] * r.uniform(0.75, 1.1, 3), 0, 1); m.geom_rgba[self.ball_geom] = rgba
         s = r.uniform(0.85, 1.2)
@@ -312,6 +327,9 @@ class BalanceEnv(gym.Env):
         self._hist = np.zeros((self.act_hist, 5))
         self._delay_buf = [np.zeros(5)] * self._action_delay
         self.kicks = self._draw_kicks(seed)
+        if self.cam_track:  # start aimed at the blade centre (known from the arm's kinematics)
+            self._aim, self._aim_want = self._yaw_pitch(self._parent_dir(self.d.geom_xpos[self.blade_geom])), None
+            self._apply_aim()
         if self.ball_noise:
             k = r.uniform(0.5, 1.5) * self.ball_noise
             self._bn = dict(k=k, bias=r.normal(0, 1, 2) * BN_BIAS * k, ou=r.normal(0, 1, 2) * BN_OU * k, gain=1 + r.uniform(-0.1, 0.1, 2) * k)
@@ -326,6 +344,47 @@ class BalanceEnv(gym.Env):
         return kick_schedule(np.random.default_rng(kseed), self.max_steps, self.kick_every, self.kick_grace,
                              self.kick_margin, self.kick_speed)
 
+    # --- camera: mounting-error features (experiment: known camera pose) and ball tracking (pan/tilt) ---
+    @staticmethod
+    def _yaw_pitch(f):
+        return np.array([np.arctan2(f[1], f[0]), np.arctan2(f[2], np.hypot(f[0], f[1]))])
+
+    def _parent_dir(self, target):
+        """Unit direction from the camera to a world point, in the camera's parent-body frame."""
+        b = self.m.cam_bodyid[self.cam_id]
+        R = self.d.xmat[b].reshape(3, 3)
+        cam_world = self.d.xpos[b] + R @ self.m.cam_pos[self.cam_id]
+        f = R.T @ (target - cam_world)
+        return f / np.linalg.norm(f)
+
+    def _apply_aim(self):
+        """Point the camera along self._aim (yaw, pitch in the parent frame), image upright, then the mounting error."""
+        y, p = self._aim
+        f = np.array([np.cos(p) * np.cos(y), np.cos(p) * np.sin(y), np.sin(p)])
+        x = np.cross(f, [0.0, 0.0, 1.0]); x /= np.linalg.norm(x)
+        z = -f
+        R = np.stack([x, np.cross(z, x), z], axis=1)
+        q = np.zeros(4); mujoco.mju_mat2Quat(q, R.ravel())
+        mujoco.mju_mulQuat(self.m.cam_quat[self.cam_id], q, self._cam_dq)
+        mujoco.mj_camlight(self.m, self.d)  # the rendered camera pose (d.cam_xmat) follows now, not at the next mj_step
+
+    def cam_features(self) -> np.ndarray:
+        """The camera's mounting offset this episode (position, rotation vector, FOV), scaled to ~unit. Real arm: calibration."""
+        return self._cam_feat.astype(np.float32)
+
+    def track_detection(self, det) -> None:
+        """Visual servo for the tracking camera: the detected ball's image offset -> a pan/tilt target, reached (speed-limited)
+        during the next step. Uses the nominal FOV only, like a real tracker; no detection = hold the aim."""
+        if not self.cam_track or det[3] == 0:
+            return
+        h, w = self.image_hw
+        tv = np.tan(np.deg2rad(self._nominal["cam_fovy"]) / 2)
+        self._aim_want = self._aim - np.array([np.arctan(det[0] * tv * w / h), np.arctan(det[1] * tv)])
+
+    def cam_aim(self) -> np.ndarray:
+        """Tracking camera pan/tilt relative to the nominal aim, rad / 0.5. Real arm: the pan/tilt servo encoders."""
+        return ((self._aim - self._aim0) / 0.5).astype(np.float32)
+
     def step(self, action):
         if self.t in self.kicks:
             self.d.qvel[self.ball_vadr:self.ball_vadr + 2] += self.kicks[self.t]
@@ -337,6 +396,10 @@ class BalanceEnv(gym.Env):
         for _ in range(self.n_substeps):
             mujoco.mj_step(self.m, self.d)
         self.t += 1
+        if self.cam_track and self._aim_want is not None:
+            self._aim = self._aim + np.clip(self._aim_want - self._aim, -CAM_TRACK_RATE, CAM_TRACK_RATE)
+            self._aim = np.clip(self._aim, self._aim0 - CAM_AIM_LIMIT, self._aim0 + CAM_AIM_LIMIT)
+            self._apply_aim()
 
         u, w, h, speed = self.ball_in_blade()
         dist = float(np.hypot(u, w))

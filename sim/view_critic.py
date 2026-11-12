@@ -28,6 +28,22 @@ AFTER_END_S = 1.0  # keep simulating this long after the episode ends
 LINES = [("critic value", (0.16, 0.47, 0.84)), ("ball dist (cm)", (0.92, 0.41, 0.20)), ("edge", (0.55, 0.55, 0.52))]
 
 
+CAMERA_NOTES = {
+    "wrist": "on the gripper: paddle edge-on, sees ball across the paddle only by its size",
+    "ego": "on a 65 cm post on the base: same camera as the wrist, sees the paddle face and the bounce zone",
+}
+
+
+def camera_label(m: mujoco.MjModel, cam_id: int, data: mujoco.MjData) -> str:
+    """Name, lens and mount of a model camera, e.g. 'ego | 62 deg vertical (~90 deg diagonal) | 66 cm high'."""
+    name = m.camera(cam_id).name
+    fovy = float(m.cam_fovy[cam_id])
+    diag = np.rad2deg(2 * np.arctan(np.tan(np.deg2rad(fovy) / 2) * 5 / 3))  # 4:3 image: half-diagonal = 5/3 x half-height
+    height = data.cam_xpos[cam_id][2] * 100
+    note = CAMERA_NOTES.get(name, "")
+    return f"{name}  |  {fovy:.0f} deg vertical (~{diag:.0f} deg diagonal)  |  {height:.0f} cm high" + (f"\n{note}" if note else "")
+
+
 def policy_label(path: str) -> str:
     """Short name for a checkpoint: '<run>/<file>' plus its training steps when saved, e.g. 'ppo_kicks/best (2.0M steps)'."""
     p = Path(path)
@@ -74,6 +90,7 @@ def main() -> None:
     p.add_argument("--kick-every", type=float, default=3.0)
     p.add_argument("--seconds", type=float, default=30.0, help="episode length")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--camera", default=None, help="start in this model camera (e.g. ego, wrist); [ and ] switch, Esc = free")
     a = p.parse_args()
     kicks = [float(k) for k in a.kicks.split(",")]
 
@@ -94,6 +111,8 @@ def main() -> None:
     # side panels hidden so the plot has the right side (Tab / Shift+Tab bring them back)
     with mujoco.viewer.launch_passive(env.m, env.d, show_left_ui=False, show_right_ui=False) as v:
         v.cam.lookat[:] = [0.41, 0.0, 0.30]; v.cam.distance = 0.9; v.cam.azimuth = 150; v.cam.elevation = -25
+        if a.camera:
+            v.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED; v.cam.fixedcamid = env.m.camera(a.camera).id
         with v.lock():  # start from the default display: no inertia boxes or other debug overlays left on
             mujoco.mjv_defaultOption(v.opt)
         while v.is_running():
@@ -114,10 +133,13 @@ def main() -> None:
                 w, h = int(vp.width * 0.34), int(vp.height * 0.5)  # right side, vertically centred
                 update_figure(fig, hist, edge_cm, has_critic)
                 v.set_figures((mujoco.MjrRect(vp.left + vp.width - w, vp.bottom + (vp.height - h) // 2, w, h), fig))
-            v.set_texts((mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT,
+            cam_text = (camera_label(env.m, v.cam.fixedcamid, env.d) if v.cam.type == mujoco.mjtCamera.mjCAMERA_FIXED
+                        else "free camera  |  ] / [ : model cameras")
+            v.set_texts([(mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPRIGHT, cam_text, ""),
+                         (mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_TOPLEFT,
                          "policy\nepisode\nstatus\ntime\nlast kick\nnext kick\nbalanced",
                          f"{policy}\n{episodes + 1} (latency {env._action_delay})\n{status}\n{env.t / CONTROL_HZ:.1f} / {a.seconds:g} s\n"
-                         f"{last_kick}\n{kicks[n_kicks % len(kicks)]:g} m/s\n{balanced}/{episodes}"))
+                         f"{last_kick}\n{kicks[n_kicks % len(kicks)]:g} m/s\n{balanced}/{episodes}")])
             v.sync()
 
             if end_step is None and (te or tr):

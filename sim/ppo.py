@@ -19,16 +19,19 @@ def mlp(inp: int, out: int, hidden: int = 256, layers: int = 2, out_gain: float 
 
 
 class ActorCritic(nn.Module):
-    """Separate actor and critic MLPs. Gaussian policy: the actor gives the mean, the std is a learned obs-independent parameter."""
+    """Separate actor and critic MLPs. Gaussian policy: the actor gives the mean, the std is a learned obs-independent parameter.
+    actor_dim < obs_dim: asymmetric actor-critic, the actor sees only obs[..., :actor_dim] (what the robot has), the critic
+    sees all of obs (plus training-only true state)."""
 
-    def __init__(self, obs_dim: int = 19, act_dim: int = 5, hidden: int = 256, init_std: float = 0.5):
+    def __init__(self, obs_dim: int = 19, act_dim: int = 5, hidden: int = 256, init_std: float = 0.5, actor_dim: int | None = None):
         super().__init__()
-        self.actor = mlp(obs_dim, act_dim, hidden, out_gain=0.01)  # near-zero first actions
+        self.actor_dim = actor_dim or obs_dim
+        self.actor = mlp(self.actor_dim, act_dim, hidden, out_gain=0.01)  # near-zero first actions
         self.critic = mlp(obs_dim, 1, hidden, out_gain=1.0)
         self.log_std = nn.Parameter(torch.full((act_dim,), float(np.log(init_std))))
 
     def dist(self, obs):
-        return torch.distributions.Normal(self.actor(obs), self.log_std.exp())
+        return torch.distributions.Normal(self.actor(obs[..., :self.actor_dim]), self.log_std.exp())
 
     def value(self, obs):
         return self.critic(obs).squeeze(-1)

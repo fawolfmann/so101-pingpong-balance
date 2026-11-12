@@ -54,6 +54,10 @@ def main():
     p.add_argument("--kick-max", type=float, default=0.0)
     p.add_argument("--kick-every", type=float, default=4.0, help="one kick per this many seconds")
     p.add_argument("--kick-margin", type=float, default=1.0, help="no kicks in the last this-many seconds (time to recover)")
+    p.add_argument("--cam-policy", action="store_true", help="one policy for the arm + tracking camera, ball seen only through "
+                   "simulated detections (sim/cam_policy_env.py); the critic also gets the true state")
+    p.add_argument("--frames", type=int, default=3, help="--cam-policy: detection frames in the obs")
+    p.add_argument("--cam-smooth", type=float, default=0.05, help="--cam-policy: reward -= this * sum((cam a - previous)^2)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-entity", default=None, help="wandb username or team (needed if the account has no default entity)")
@@ -92,9 +96,10 @@ def main():
                         home_penalty=a.home_penalty, servo_rand=a.servo_rand, ball_noise=a.ball_noise,
                         max_steps=round(getattr(a, "episode_s", 10.0) * 30), kick_min=getattr(a, "kick_min", 0.0),
                         kick_max=getattr(a, "kick_max", 0.0), kick_every=getattr(a, "kick_every", 4.0),
-                        kick_margin=getattr(a, "kick_margin", 1.0), smooth_penalty=getattr(a, "smooth_penalty", 0.01))  # getattr: --resume of runs saved before these flags
+                        kick_margin=getattr(a, "kick_margin", 1.0), smooth_penalty=getattr(a, "smooth_penalty", 0.01),  # getattr: --resume of runs saved before these flags
+                        **(dict(cam_policy=True, frames=a.frames, cam_smooth=a.cam_smooth, cam_rand=0.3) if getattr(a, "cam_policy", False) else {}))
     N, T = env.n_envs, a.steps
-    ac = ActorCritic(env.obs_dim, env.act_dim).to(dev)
+    ac = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim).to(dev)
     opt = torch.optim.Adam(ac.parameters(), lr=a.lr, eps=1e-5)
     if ckpt:
         ac.load_state_dict(ckpt["model"])
