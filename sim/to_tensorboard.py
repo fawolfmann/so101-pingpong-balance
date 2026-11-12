@@ -102,6 +102,16 @@ def eval_blocks(text: str):
     return blocks
 
 
+def eval_name(log: Path, header: str) -> str:
+    """Run name for one evaluation table: the policy (arm + camera policies) or the log, plus the test variant."""
+    first = header.split(" | ")[0]
+    name = Path(first).parent.name if first.startswith("outputs/controller/") else log.stem.removeprefix("eval_")
+    name += "_simdet" if "simulated detections" in header else ""
+    name += "_upkick" if "push up" in header else ""
+    name += "_elastic" if "contact damp" in header else ""
+    return name
+
+
 def evals(logdir: Path) -> int:
     n = 0
     for log in sorted(OUT.glob("eval_*.log")):
@@ -109,9 +119,8 @@ def evals(logdir: Path) -> int:
         if not blocks:
             continue
         runs: dict[str, list] = {}
-        for b in blocks:  # the arm + camera policy log holds two variants: rendered and simulated detections
-            variant = log.stem.removeprefix("eval_") + ("_simdet" if "simulated detections" in b["header"] else "")
-            runs.setdefault(variant, []).append(b)
+        for b in blocks:  # one log can hold several variants (detections, upward pushes, contact) and policies
+            runs.setdefault(eval_name(log, b["header"]), []).append(b)
         for name, bs in runs.items():
             w = writer(logdir, f"eval/{name}")
             for b in bs:

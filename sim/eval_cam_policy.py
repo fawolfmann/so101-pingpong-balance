@@ -4,7 +4,8 @@
     uv run python -m sim.eval_cam_policy --policy ... --sim-det      # simulated detections (what it was trained on)
 
 Same test as perception.estimator --eval: seeds 10000+i, servo and camera randomization, latency forced per row,
---nudges pushes of 0.25 m/s at random steps. Also reports how the camera was used: detection rate, ball offset from
+--nudges pushes of 0.25 m/s at random steps. Bouncing: --nudge-up lo,hi adds an upward speed to every push (m/s),
+--contact-damp lo,hi makes the ball/blade contact elastic (as in training with those flags). Also reports how the camera was used: detection rate, ball offset from
 the image centre, pan/tilt speed.
 """
 from __future__ import annotations
@@ -24,8 +25,12 @@ def _init(cfg):
     torch.set_num_threads(1)
     ac = load_controller(cfg["policy"])
     ta = ac.train_args
+    extra = dict(contact_damp=cfg["contact_damp"]) if cfg["contact_damp"] else {}
     _G.update(cfg=cfg, ac=ac, env=CamPolicyEnv(render=not cfg["sim_det"], frames=ta.get("frames", 3), act_hist=ta["act_hist"],
-                                              domain_rand=True, servo_rand=True, cam_rand=0.3, max_latency=cfg["max_lat"]))
+                                              domain_rand=True, servo_rand=True, cam_rand=0.3, max_latency=cfg["max_lat"],
+                                              track_gate=ta.get("track_gate", 0.0), **extra))
+    if cfg["nudge_up"]:
+        _G["env"].env.airborne_ok = True  # the ball may leave the blade
 
 
 def _episode(job):
@@ -36,11 +41,13 @@ def _episode(job):
     env.env._action_delay, env.env._delay_buf, env._cam_buf = lat, [np.zeros(5)] * lat, [np.zeros(2)] * lat
     rng = np.random.default_rng(seed + 777)  # the same nudges as perception.estimator's evaluation
     nudges = {int(t): rng.uniform(0, 2 * np.pi) for t in rng.integers(30, 280, cfg["nudges"])}
+    up = np.random.default_rng(seed + 778)  # separate stream: the push times and directions match the sideways test
     seen, off, cam_speed = [], [], []
     for t in range(env.max_steps):
         a = controller_action(ac, obs[:ac.actor_dim])
         if t in nudges:
-            env.env.d.qvel[env.env.ball_vadr:env.env.ball_vadr + 2] += 0.25 * np.array([np.cos(nudges[t]), np.sin(nudges[t])])
+            vz = up.uniform(*cfg["nudge_up"]) if cfg["nudge_up"] else 0.0
+            env.env.d.qvel[env.env.ball_vadr:env.env.ball_vadr + 3] += np.r_[0.25 * np.cos(nudges[t]), 0.25 * np.sin(nudges[t]), vz]
         obs, _, te, tr, info = env.step(a)
         det = info["det"]
         seen.append(det[3]); cam_speed.append(np.abs(a[5:7]).max())
@@ -60,13 +67,18 @@ def main():
     p.add_argument("--nudges", type=int, default=0)
     p.add_argument("--sim-det", action="store_true", help="simulated detections instead of rendering")
     p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--nudge-up", default="", help="upward speed range added to every push, 'lo,hi' m/s")
+    p.add_argument("--contact-damp", default="", help="elastic ball/blade contact, damping range 'lo,hi'")
     a = p.parse_args()
+    pair = lambda v: tuple(float(x) for x in v.split(",")) if v else None
     lats = [int(v) for v in a.latency.split(",")]
     jobs = [(lat, 10_000 + i) for lat in lats for i in range(a.episodes)]
-    cfg = dict(policy=a.policy, nudges=a.nudges, sim_det=a.sim_det, max_lat=max(lats))
+    cfg = dict(policy=a.policy, nudges=a.nudges, sim_det=a.sim_det, max_lat=max(lats), nudge_up=pair(a.nudge_up),
+               contact_damp=pair(a.contact_damp))
     with mp.get_context("spawn").Pool(a.workers, _init, (cfg,)) as pool:
         res = pool.map(_episode, jobs, chunksize=1)
-    print(f"\n{a.policy} | {'simulated' if a.sim_det else 'rendered'} detections | {a.episodes} episodes per row | nudges {a.nudges}")
+    print(f"\n{a.policy} | {'simulated' if a.sim_det else 'rendered'} detections | {a.episodes} episodes per row | nudges {a.nudges}"
+          + (f" | push up {a.nudge_up} m/s" if a.nudge_up else "") + (f" | contact damp {a.contact_damp}" if a.contact_damp else ""))
     print(f"{'latency':>8} {'success':>9} {'len':>5} {'final dist':>11}  {'ball seen':>9} {'|offset|':>9} {'cam |a|':>8}")
     for lat in lats + ([None] if len(lats) > 1 else []):
         rs = [r for r in res if lat is None or r["lat"] == lat]
