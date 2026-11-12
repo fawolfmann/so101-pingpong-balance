@@ -27,6 +27,9 @@ full smooth_penalty and a joint-acceleration penalty everywhere except the hit w
 the blade), where only juggle_smooth applies: one clean move at the hit, no shaking in between. The episode ends on
 a drop or a stall (no counted bounce for JUGGLE_STALL_S: holding the ball earns nothing), with no extra penalty for
 either: the score is the time juggled. Success: juggled to the end.
+juggle_reward="clean": only survival, smoothness and a dwell penalty: 1 per step while the ball is up (no centring, hit,
+height or release bonuses), - dwell_w per step once the ball has sat on the blade for over DWELL_GRACE_S (no catch and
+stop), the same smoothness / joint-acceleration penalties; the camera terms live in sim/cam_policy_env.py.
 """
 from __future__ import annotations
 
@@ -76,6 +79,8 @@ HIT_WINDOW_LIFT = 0.035  # m: the ball this close to the blade = the hit window 
 JUGGLE_ACC_W = 0.05  # outside the window: reward -= W * sum((joint velocity change per step, rad/s)^2): no shaking
 HIT_LEVEL_W, HIT_LEVEL_SIGMA = 0.5, np.deg2rad(5.0)  # at each ball/blade impact: blade normal close to vertical
 HIT_LATERAL_W, HIT_LATERAL_SIGMA = 0.5, 0.1  # ... and blade moving straight up (sideways speed, m/s)
+DWELL_LIFT = 0.008  # m: the ball this close to its resting position is sitting on the blade (clean juggling reward)
+DWELL_GRACE_S = 0.25  # s on the blade before the dwell penalty starts (a hit, or launching a resting ball, takes a moment)
 KICK_SEED_SALT = 0x6B69636B  # "kick": the kick generator is seeded from (seed, salt), independent of the env's main rng
 
 
@@ -154,6 +159,8 @@ class BalanceEnv(gym.Env):
         juggle_acc: float = JUGGLE_ACC_W,  # joint-acceleration penalty between hits in juggling episodes
         juggle_target: tuple[float, float] | None = None,  # juggling: commanded apex height range (m), redrawn every 1-3 bounces
         height_w: float = HEIGHT_W,  # weight of the bonus for a bounce at the commanded height
+        juggle_reward: str = "default",  # "clean": survival + smoothness + dwell penalty only (module docstring)
+        dwell_w: float = 1.0,  # clean juggling: penalty per step once the ball has sat on the blade over DWELL_GRACE_S
         seed: int | None = None,
     ):
         if not 0.0 <= kick_min <= kick_max:
@@ -179,6 +186,9 @@ class BalanceEnv(gym.Env):
         self.juggle_target = tuple(juggle_target) if juggle_target is not None else None
         self.target_apex = 0.0  # the commanded apex height of the next bounce (0 = none)
         self.height_w = height_w
+        if juggle_reward not in ("default", "clean"):
+            raise ValueError(f"juggle_reward must be 'default' or 'clean', got {juggle_reward!r}")
+        self.juggle_reward, self.dwell_w = juggle_reward, dwell_w
 
         self.grip_rot_deg = grip_rot_deg
         # wrist roll compensates the grip rotation, so the blade has the same world pose
@@ -391,6 +401,7 @@ class BalanceEnv(gym.Env):
             self._target_errs, self._release_errs = [], []
             self._new_target()
             self._impacts, self._jit_between, self._touching = [], [], False  # dropped from above: not touching yet
+            self._dwell, self._dwell_steps = 0, 0  # consecutive / total steps with the ball sitting on the blade
             self._qd_prev = self.d.qvel[self.v_adr].copy()
         if self.cam_track:  # start aimed at the blade centre (known from the arm's kinematics)
             self._aim, self._aim_want = self._yaw_pitch(self._parent_dir(self.d.geom_xpos[self.blade_geom])), None
@@ -482,16 +493,23 @@ class BalanceEnv(gym.Env):
         smooth = self.smooth_penalty
         if self.juggle:  # 1 per step while juggled (the return is the time juggled), light centring, straight hits
             juggled, straight = self._count_bounce(dist)
-            reward = float(juggled) + JUGGLE_CENTRE_W * centre + straight
-            if release is not None and self.juggle_target is not None and release > RELEASE_MIN_VZ:
+            clean = self.juggle_reward == "clean"
+            reward = 1.0 if clean else float(juggled) + JUGGLE_CENTRE_W * centre + straight
+            if clean:
+                self._dwell = self._dwell + 1 if self.ball_lift()[0] < DWELL_LIFT else 0
+                self._dwell_steps += self._dwell > 0
+                if self._dwell > round(DWELL_GRACE_S * CONTROL_HZ):
+                    reward -= self.dwell_w
+            if release is not None and not clean and self.juggle_target is not None and release > RELEASE_MIN_VZ:
                 # the hit sets the height: reward leaving the blade at the speed that reaches the commanded height
                 v_need = float(np.sqrt(2 * 9.81 * self.target_apex))
                 reward += RELEASE_W * (1.0 - min(abs(release - v_need) / RELEASE_SPAN, 1.0))
                 self._release_errs.append(release - v_need)
-            if impact is not None:  # a clean hit: blade level and moving straight up when the ball lands on it
+            if impact is not None and not clean:  # a clean hit: blade level and moving straight up when the ball lands on it
                 tilt, lateral = impact
                 reward += HIT_LEVEL_W * float(np.exp(-(tilt / HIT_LEVEL_SIGMA) ** 2))
                 reward += HIT_LATERAL_W * float(np.exp(-(lateral / HIT_LATERAL_SIGMA) ** 2))
+            if impact is not None:
                 self._impacts.append(impact)
             qd = self.d.qvel[self.v_adr].copy()
             in_window = self.ball_lift()[0] < HIT_WINDOW_LIFT
@@ -537,7 +555,8 @@ class BalanceEnv(gym.Env):
                          release_err=float(np.mean(np.abs(self._release_errs))) if self._release_errs else float("nan"),
                          hit_tilt_deg=float(np.rad2deg(np.mean([i[0] for i in self._impacts]))) if self._impacts else float("nan"),
                          hit_lateral=float(np.mean([i[1] for i in self._impacts])) if self._impacts else float("nan"),
-                         jitter_between=float(np.mean(self._jit_between)) if self._jit_between else float("nan"))
+                         jitter_between=float(np.mean(self._jit_between)) if self._jit_between else float("nan"),
+                         on_blade_frac=self._dwell_steps / max(self.t, 1))
         else:
             success = bool(truncated and not terminated and dist < self.success_radius and on_blade)
             extra = {}

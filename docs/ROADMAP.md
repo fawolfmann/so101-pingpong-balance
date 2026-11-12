@@ -324,7 +324,10 @@ Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=Tru
 | + 4M steps PPO (`juggle_ppo`) | 10/36 | 13.9 | 0.27 | 1.6 deg | - |
 | + clean-hit reward (`juggle_clean`) | **19/36** | **19.0** | 0.16 | 1.1 deg | 17.5 |
 | + camera following, reversal penalty, height command (`juggle_height`) | 16/36 | 18.0 | **0.15** | 1.3 deg | 8.9 |
-| same reward, **from scratch** (`juggle_scratch`, 12.3M steps, start std 0.6) | 14/36 | 15.5 | 0.17 | 1.3 deg | **8.0** |
+| same reward, **from scratch** (`juggle_scratch`, 12.3M steps, start std 0.5*) | 14/36 | 15.5 | 0.17 | 1.3 deg | **8.0** |
+| **clean reward from scratch**, any start height (`juggle_free`, 24.6M steps, start std 0.8) | **22/36** | **20.0** | **0.12** | 1.1 deg | 8.1 |
+
+\* `--init-std` was then applied only with `--init-from`; this run started at the default 0.5 (fixed since).
 
 - More steps help (PPO 4.1 -> 6 s in training). **PPO beat GRPO on juggling** at the same start and budget (5.2 vs 2.9 s
   at 1.5M steps): GRPO declined and its exploration collapsed (std 0.12 -> 0.07). Long episodes of very different
@@ -350,6 +353,22 @@ Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=Tru
   as the fine-tuned chain (14 vs 16/36 to 30 s) and **follows the ball with the camera far better**: mean ball offset
   from the image centre 0.11 vs 0.38 (fine-tuned policies kept the wandering camera they started with). Same optimum
   for the height command: ignored (correlation 0.00), as expected from the same reward.
+- **Clean reward** (`--juggle-reward clean`, `juggle_free`): no bonuses at all. +1 per step while the ball is up, -1 per
+  step once it has sat on the blade over 0.25 s (`--dwell-w`; no catch-and-stop), the stall rule, the same paddle
+  smoothness terms, and for the camera a **dead zone** (`--cam-zone 0.35`): no penalty while the ball is within 0.35 of
+  the image centre, linear up to -`cam-track-w` at the edge or out of view, plus the reversal penalty. Starts are
+  varied: a quarter of the episodes start with the ball **resting on the blade** (`--juggle-rest-frac 0.25`; the policy
+  has to launch it), the rest dropped 0-30 cm. 8000 iterations from scratch, 163 min. Best juggler so far and the
+  calmest paddle, with fewer reward terms. Deterministic, 30 s episodes, 36 per row:
+
+  | start | full 30 s | mean s | drops | stalls | apex cm | jitter between hits |
+  |---|---|---|---|---|---|---|
+  | dropped 8-15 cm (as the table above) | 22/36 | 20.0 | 5 | 9 | 4.8 | 0.12 |
+  | resting on the blade | 18/36 | 16.7 | 6 | 12 | 4.6 | 0.13 |
+  | dropped 20-30 cm | 13/36 | 14.1 | 12 | 11 | 8.3 | 0.12 |
+
+  Still short bounces (~5 cm: the survival optimum, as above); high drops are the hardest (catching a fast ball, most
+  drops at latency 4). The ball sits ~0.21 from the image centre (inside the dead zone, as intended).
 
 ### Multi-task: one network for several skills
 

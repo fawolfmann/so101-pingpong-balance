@@ -11,7 +11,8 @@ Critic-only extra (appended): true ball (u, w, vu, vw) in controller units, true
 along the blade normal / 1 m/s. The actor is the same either way.
 juggle=True: the actor gets one more input last, the mode (1 = juggling episode, 0 = balance), and the critic one more
 last, the time since the last counted bounce (s). A juggle_frac share of the episodes juggle (ball dropped from
-juggle_drop m, sim/env.py JUGGLE_*); the rest are the usual balance episodes.
+juggle_drop m, sim/env.py JUGGLE_*; a juggle_rest_frac share of them start with the ball resting on the blade instead);
+the rest are the usual balance episodes.
 Action: [0:5] joint deltas as BalanceEnv; [5:7] pan/tilt rate, x CAM_TRACK_RATE rad per step. The camera command goes
 through the same latency as the arm.
 
@@ -90,7 +91,8 @@ class CamPolicyEnv:
     def __init__(self, render: bool = False, frames: int = 3, act_hist: int = 3, cam_smooth: float = 0.05,
                  det_noise: DetNoise | None = None, height_info: bool = False, track_gate: float = 0.0,
                  juggle: bool = False, juggle_frac: float = 0.0, juggle_drop: tuple[float, float] = (0.08, 0.15),
-                 cam_track_w: float = 0.0, cam_reversal_w: float = 0.0, **env_kw):
+                 cam_track_w: float = 0.0, cam_reversal_w: float = 0.0, juggle_rest_frac: float = 0.0,
+                 cam_zone: float = 0.0, **env_kw):
         self.render, self.frames, self.act_hist, self.cam_smooth = render, frames, act_hist, cam_smooth
         self.noise = det_noise if det_noise is not None else DetNoise.load()
         env_kw.setdefault("grip_rot_deg", -90.0)
@@ -100,11 +102,13 @@ class CamPolicyEnv:
         else:
             self.env = BalanceEnv(obs_mode="controller", camera="ego", cam_track=True, image_hw=EGO_HW, **env_kw)
         self.height_info, self.juggle, self.juggle_frac, self.juggle_drop = height_info, juggle, juggle_frac, tuple(juggle_drop)
+        self.juggle_rest_frac = juggle_rest_frac  # share of juggling episodes that start with the ball resting on the blade
         if juggle_frac > 0 and not juggle:
             raise ValueError("juggling episodes need juggle=True (the policy must be told the mode)")
         self.height_cmd = env_kw.get("juggle_target") is not None  # the commanded bounce height is an actor input
         self.cam_track_w = cam_track_w  # reward for keeping the ball near the image centre (true projection, training only)
         self.cam_reversal_w = cam_reversal_w  # penalty for pan/tilt direction reversals (fast in one direction is fine)
+        self.cam_zone = cam_zone  # > 0: cam_track_w is a penalty outside a central circle of this radius instead
         self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info, juggle, self.height_cmd)
         self.detector = BallDetector(track=True, hw=EGO_HW, gate=track_gate)
         self.rng = np.random.default_rng()
@@ -145,12 +149,26 @@ class CamPolicyEnv:
             priv = np.r_[priv, e.since_bounce()]
         return np.concatenate([actor, priv]).astype(np.float32)
 
+    def _track_term(self, proj) -> float:
+        """cam_zone = 0: reward in [0, 1] for the ball near the image centre (1 at the centre, 0 from 0.5 out).
+        cam_zone > 0: a dead zone, 0 while the ball is within cam_zone of the centre (image units, [-1, 1] across),
+        falling linearly to -1 at the image edge; -1 when the ball is out of view."""
+        d = float(np.hypot(proj[0], proj[1]))
+        if self.cam_zone <= 0:
+            return 1.0 - min(d / 0.5, 1.0) if proj[3] else 0.0
+        if not proj[3]:
+            return -1.0
+        return -min(max(d - self.cam_zone, 0.0) / (1.0 - self.cam_zone), 1.0)
+
     def reset(self, seed: int | None = None, juggle: bool | None = None):
         """juggle: force a juggling (True) or balance (False) episode; None = drawn with juggle_frac."""
         mode = np.random.default_rng(None if seed is None else [seed, 0x7A])
         if juggle is None:
             juggle = self.juggle and mode.uniform() < self.juggle_frac
-        opts = dict(juggle=True, drop=float(mode.uniform(*self.juggle_drop))) if juggle else {}
+        drop = float(mode.uniform(*self.juggle_drop))
+        if mode.uniform() < self.juggle_rest_frac:
+            drop = 0.0  # resting on the blade: the policy has to launch it
+        opts = dict(juggle=True, drop=drop) if juggle else {}
         obs, info = self.env.reset(seed=seed, options=opts)
         self.rng = np.random.default_rng(None if seed is None else [seed, 0xCA])
         self._ep = self.noise.new_episode(self.rng)
@@ -176,10 +194,8 @@ class CamPolicyEnv:
         flips = np.maximum(0.0, -a[5:7] * self._prev_cam)  # > 0 only when a pan/tilt rate changes sign
         r -= self.cam_reversal_w * float(np.sum(flips))
         self.cam_flips += int(np.sum((a[5:7] * self._prev_cam < 0) & (np.abs(a[5:7]) > 0.05) & (np.abs(self._prev_cam) > 0.05)))
-        if self.cam_track_w > 0:  # follow the ball: reward it near the image centre (where it really is, not the detection)
-            proj = project(e)
-            if proj[3]:
-                r += self.cam_track_w * (1.0 - min(float(np.hypot(proj[0], proj[1])) / 0.5, 1.0))
+        if self.cam_track_w > 0:  # follow the ball (where it really is, not the detection)
+            r += self.cam_track_w * self._track_term(project(e))
         self._prev_cam = a[5:7]
         det = self._detect(obs, e._aim - aim0)  # the servo encoders give the camera's turn
         self._dets = np.roll(self._dets, 1, axis=0); self._dets[0] = det

@@ -45,6 +45,8 @@ def bounce_kwargs(a) -> dict:
         if getattr(a, "juggle_target", ""):
             kw["juggle_target"] = tuple(float(v) for v in a.juggle_target.split(","))
             kw["height_w"] = getattr(a, "height_w", 2.0)
+        if getattr(a, "juggle_reward", "default") != "default":
+            kw.update(juggle_reward=a.juggle_reward, dwell_w=a.dwell_w)
     return kw
 
 
@@ -59,6 +61,10 @@ def cam_bounce_kwargs(a) -> dict:
         kw["cam_track_w"] = a.cam_track_w
     if getattr(a, "cam_reversal_w", 0.0) > 0:
         kw["cam_reversal_w"] = a.cam_reversal_w
+    if getattr(a, "cam_zone", 0.0) > 0:
+        kw["cam_zone"] = a.cam_zone
+    if getattr(a, "juggle_rest_frac", 0.0) > 0:
+        kw["juggle_rest_frac"] = a.juggle_rest_frac
     return kw
 
 
@@ -130,6 +136,12 @@ def main():
     p.add_argument("--juggle-acc", type=float, default=0.05, help="joint-acceleration penalty between hits (juggling)")
     p.add_argument("--juggle-target", default="", help="juggling: commanded bounce height range 'lo,hi' m, redrawn every "
                    "1-3 bounces (adds the height command input); empty = off")
+    p.add_argument("--cam-zone", type=float, default=0.0, help="--cam-policy: with --cam-track-w, no penalty while the ball "
+                   "is within this radius of the image centre (image units, 1 = edge), linear penalty outside it")
+    p.add_argument("--juggle-reward", default="default", choices=["default", "clean"],
+                   help="juggling reward: 'clean' = survival + smoothness + dwell penalty only (sim/env.py)")
+    p.add_argument("--dwell-w", type=float, default=1.0, help="clean juggling: penalty per step with the ball sitting on the blade")
+    p.add_argument("--juggle-rest-frac", type=float, default=0.0, help="juggling: share of episodes starting with the ball at rest")
     p.add_argument("--height-w", type=float, default=2.0, help="juggling: bonus per bounce at the commanded height")
     p.add_argument("--cam-track-w", type=float, default=0.0, help="--cam-policy: reward for keeping the ball near the image centre")
     p.add_argument("--cam-reversal-w", type=float, default=0.0, help="--cam-policy: penalty for pan/tilt direction reversals "
@@ -138,7 +150,7 @@ def main():
                    "balance episodes (mode 0) close to the starting policy (KL weight); 0 = off")
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
                    "the bouncing critic inputs gets zero weights for them)")
-    p.add_argument("--init-std", type=float, default=0.0, help="with --init-from: reset the exploration std to this (0 = keep)")
+    p.add_argument("--init-std", type=float, default=0.0, help="starting exploration std (0 = the default 0.5, or with --init-from the checkpoint's)")
     p.add_argument("--critic-warmup", type=int, default=0, help="with --init-from: train only the critic for this many "
                    "iterations (the actor stays frozen until the value estimates fit the new task)")
     p.add_argument("--save-every", type=int, default=50)
@@ -187,10 +199,10 @@ def main():
     ac = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim).to(dev)
     if getattr(a, "init_from", "") and not ckpt:
         ac.load_state_dict(init_weights(a, env.obs_dim))
-        if a.init_std > 0:
-            with torch.no_grad():
-                ac.log_std.fill_(float(np.log(a.init_std)))
         print(f"initialized from {a.init_from}", flush=True)
+    if getattr(a, "init_std", 0.0) > 0 and not ckpt:  # the starting exploration noise, from scratch or a checkpoint
+        with torch.no_grad():
+            ac.log_std.fill_(float(np.log(a.init_std)))
     anchor = None
     if getattr(a, "anchor_coef", 0.0) > 0 and getattr(a, "init_from", ""):
         ref = ActorCritic(env.obs_dim, env.act_dim, actor_dim=env.actor_dim).to(dev)
@@ -276,7 +288,7 @@ def main():
             row.update(success_upkick=nan, success_sidekick=nan)
         if getattr(a, "juggle_frac", 0.0) > 0:
             row.update(juggle_s=nan, juggle_bounces=nan, juggle_stalled=nan, success_balance=nan, jitter_between=nan, hit_tilt_deg=nan,
-                       apex_std_cm=nan, target_err_cm=nan, cam_flips_per_s=nan)
+                       apex_std_cm=nan, target_err_cm=nan, cam_flips_per_s=nan, apex_mean_cm=nan, on_blade_frac=nan)
         if recent:
             row.update(ep_return=float(np.mean([e["ret"] for e in recent])), ep_len=float(np.mean([e["length"] for e in recent])),
                        success=float(np.mean([e["success"] for e in recent])))
@@ -293,6 +305,8 @@ def main():
                 row["apex_std_cm"] = 100 * float(np.nanmean([e.get("apex_std", np.nan) for e in js])) if js else float("nan")
                 row["target_err_cm"] = 100 * float(np.nanmean([e.get("target_err", np.nan) for e in js])) if js else float("nan")
                 row["cam_flips_per_s"] = float(np.nanmean([e.get("cam_flips", np.nan) for e in js])) if js else float("nan")
+                row["apex_mean_cm"] = 100 * float(np.nanmean([e.get("apex_mean", np.nan) for e in js])) if js else float("nan")
+                row["on_blade_frac"] = float(np.nanmean([e.get("on_blade", np.nan) for e in js])) if js else float("nan")
                 bs = [e["success"] for e in recent if not e.get("juggle")]
                 row["success_balance"] = float(np.mean(bs)) if bs else float("nan")
             if getattr(a, "kick_z_max", 0.0) > 0:
@@ -313,7 +327,7 @@ def main():
                      if getattr(a, "kick_z_max", 0.0) > 0 else "")
                   + (f" | juggle {row['juggle_s']:.1f} s {row['juggle_bounces']:.1f} bounces stall {row['juggle_stalled']:.2f}"
                      f" jitter {row['jitter_between']:.3f} tilt {row['hit_tilt_deg']:.1f}°"
-                     f" apex spread {row['apex_std_cm']:.1f} cm target err {row['target_err_cm']:.1f} cm"
+                     f" apex {row['apex_mean_cm']:.1f}±{row['apex_std_cm']:.1f} cm on-blade {row['on_blade_frac']:.2f}"
                      f" cam flips {row['cam_flips_per_s']:.1f}/s"
                      f" balance {row['success_balance']:.2f}" if getattr(a, "juggle_frac", 0.0) > 0 else ""), flush=True)
 

@@ -136,3 +136,38 @@ def test_height_command_starts_from_the_juggling_policy():
     o, _ = env.reset(seed=3)
     assert o.shape == (f1,) and 0.2 <= o[a1 - 1] <= 1.0  # target / 0.2 for a 4-20 cm command
     assert 0.04 <= env.env.target_apex <= 0.2
+
+
+def test_clean_juggling_reward_penalises_a_resting_ball():
+    """Clean reward: 1 per step while up; a ball left sitting on the blade costs dwell_w per step after the grace."""
+    from sim.env import CONTROL_HZ, DWELL_GRACE_S
+    env = BalanceEnv(contact_damp=(30.0, 30.0), juggle_reward="clean", dwell_w=1.0, smooth_penalty=0.0, juggle_acc=0.0)
+    env.reset(seed=0, options=dict(juggle=True, drop=0.0))
+    rewards = [env.step(np.zeros(5))[1] for _ in range(20)]
+    grace = round(DWELL_GRACE_S * CONTROL_HZ)
+    assert np.allclose(rewards[:grace], 1.0, atol=1e-6)
+    assert np.allclose(rewards[grace + 2:], 0.0, atol=1e-6)
+
+
+def test_clean_juggling_reward_has_no_dwell_penalty_in_flight():
+    env = BalanceEnv(contact_damp=(30.0, 30.0), juggle_reward="clean", smooth_penalty=0.0, juggle_acc=0.0)
+    env.reset(seed=0, options=dict(juggle=True, drop=0.15))
+    rewards = [env.step(np.zeros(5))[1] for _ in range(8)]  # ~0.27 s: still falling, then the first bounce
+    assert np.allclose(rewards, 1.0, atol=1e-6)
+
+
+def test_unknown_juggle_reward_is_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        BalanceEnv(juggle_reward="fancy")
+
+
+def test_camera_dead_zone():
+    from sim.cam_policy_env import CamPolicyEnv
+    env = CamPolicyEnv.__new__(CamPolicyEnv)
+    env.cam_zone = 0.4
+    assert env._track_term(np.array([0.3, 0.2, 1.0, 1.0])) == 0.0  # inside the zone: no penalty
+    assert np.isclose(env._track_term(np.array([0.7, 0.0, 1.0, 1.0])), -0.5)
+    assert env._track_term(np.zeros(4)) == -1.0  # out of view
+    env.cam_zone = 0.0  # the old reward is unchanged
+    assert np.isclose(env._track_term(np.array([0.25, 0.0, 1.0, 1.0])), 0.5)

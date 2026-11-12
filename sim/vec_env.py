@@ -19,7 +19,8 @@ def make_train_env(env_kwargs):
     if kw.pop("cam_policy", False):
         from sim.cam_policy_env import CamPolicyEnv
         return CamPolicyEnv(**kw)
-    for k in ("frames", "cam_smooth", "height_info", "track_gate", "juggle", "juggle_frac", "juggle_drop", "cam_track_w", "cam_reversal_w"):
+    for k in ("frames", "cam_smooth", "height_info", "track_gate", "juggle", "juggle_frac", "juggle_drop", "cam_track_w", "cam_reversal_w",
+              "juggle_rest_frac", "cam_zone"):
         kw.pop(k, None)
     from sim.env import BalanceEnv
     return BalanceEnv(obs_mode="controller", **kw)
@@ -60,7 +61,8 @@ def _worker(conn, env_kwargs, seeds):
                                     juggle_s=info.get("juggle_s", 0.0), n_bounces=info.get("n_bounces", 0),
                                     stalled=bool(info.get("stalled", False)), jitter=info.get("jitter_between", float("nan")),
                                     tilt=info.get("hit_tilt_deg", float("nan")), apex_std=info.get("apex_std", float("nan")),
-                                    target_err=info.get("target_err", float("nan")), cam_flips=info.get("cam_flips_per_s", float("nan"))))
+                                    target_err=info.get("target_err", float("nan")), cam_flips=info.get("cam_flips_per_s", float("nan")),
+                                    apex_mean=info.get("apex_mean", float("nan")), on_blade=info.get("on_blade_frac", float("nan"))))
                     ret[i], length[i] = 0.0, 0
                     o, _ = e.reset()
                 obs.append(o); rew.append(r); term.append(te); trunc.append(tr); final.append(fo)
