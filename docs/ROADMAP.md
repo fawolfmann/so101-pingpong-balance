@@ -315,6 +315,38 @@ Implemented as planned (`sim/env.py` juggling episodes, `CamPolicyEnv(juggle=Tru
 - Reward pitfall: with -5 for a drop and nothing for a stall, holding the ball was the safe choice. The score is the time
   juggled, so a drop and a stall must cost the same.
 
+**Longer training, clean hits, camera, bounce height** (all deterministic, simulated detections, 36 juggling episodes of
+30 s, latency 0/2/4; `eval_cam_policy --juggle --seconds 30`):
+
+| policy | full 30 s | mean s | jitter between hits | hit tilt | camera reversals/s |
+|---|---|---|---|---|---|
+| juggle-only (2.5M steps) | 1/60 | 4.0 | 0.25 | 1.8 deg | - |
+| + 4M steps PPO (`juggle_ppo`) | 10/36 | 13.9 | 0.27 | 1.6 deg | - |
+| + clean-hit reward (`juggle_clean`) | **19/36** | **19.0** | 0.16 | 1.1 deg | 17.5 |
+| + camera following, reversal penalty, height command (`juggle_height`) | 16/36 | 18.0 | **0.15** | 1.3 deg | **8.9** |
+
+- More steps help (PPO 4.1 -> 6 s in training). **PPO beat GRPO on juggling** at the same start and budget (5.2 vs 2.9 s
+  at 1.5M steps): GRPO declined and its exploration collapsed (std 0.12 -> 0.07). Long episodes of very different
+  lengths make one score per episode a noisy signal; PPO's critic gives per-step credit.
+- The paddle shook between hits (jitter 0.25, worse than the old tremor) because the low smoothness penalty applied
+  everywhere. Clean hits: smooth everywhere (`--juggle-calm`, joint-acceleration `--juggle-acc`) except a hit window
+  around each contact (`--juggle-smooth`), plus a reward for a level blade moving straight up at impact. This also made
+  juggling last longer.
+- The camera wandered (nothing rewarded following the ball) and reversed direction ~19 times/s. A reward for the ball
+  near the image centre (`--cam-track-w`, true projection, training only) and a penalty on pan/tilt sign flips
+  (`--cam-reversal-w`: max(0, -rate_t * rate_t-1); a fast move in one direction is free) halved the reversals.
+- **Bounce height was never controlled.** A commanded height input (`--juggle-target`), rewarded at the apex and at the
+  release (ball leaving the blade at sqrt(2 g h)), was ignored in four runs: bounces stay ~5 cm whatever the command
+  (`python -m sim.height_follow <ckpt>`: correlation 0.01). Two causes:
+  1. **Narrow bell-shaped rewards give no signal far from the target**: exp(-(err/2.5 cm)^2) is ~0 at a 6 cm miss, and a
+     0.25 m/s bell around the needed release speed is 0 for a policy 0.8 m/s too slow. Prefer linear shaping
+     (W * (1 - |err| / span)), which rewards every step closer.
+  2. **Incentives**: staying alive pays ~30/s; matching the height pays a few per second and taller hits risk a drop
+     that loses all future reward. A short safe bounce is the real optimum of that reward.
+  Next options: count a bounce only if it reaches its commanded height (the command then decides survival), a separate
+  height-control expert, or (if variety is the goal, not control) reward the change in height between bounces.
+- A from-scratch policy with the same reward (`juggle_scratch`, start std 0.6) reached ~5 s juggled in 1500 iterations.
+
 ### Multi-task: one network for several skills
 
 Why one network struggles with two tasks, and what is known to work (multi-task RL literature):

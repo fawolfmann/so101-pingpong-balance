@@ -44,6 +44,7 @@ def bounce_kwargs(a) -> dict:
         kw["juggle_acc"] = getattr(a, "juggle_acc", 0.05)
         if getattr(a, "juggle_target", ""):
             kw["juggle_target"] = tuple(float(v) for v in a.juggle_target.split(","))
+            kw["height_w"] = getattr(a, "height_w", 2.0)
     return kw
 
 
@@ -56,6 +57,8 @@ def cam_bounce_kwargs(a) -> dict:
         kw["track_gate"] = a.track_gate
     if getattr(a, "cam_track_w", 0.0) > 0:
         kw["cam_track_w"] = a.cam_track_w
+    if getattr(a, "cam_reversal_w", 0.0) > 0:
+        kw["cam_reversal_w"] = a.cam_reversal_w
     return kw
 
 
@@ -127,7 +130,10 @@ def main():
     p.add_argument("--juggle-acc", type=float, default=0.05, help="joint-acceleration penalty between hits (juggling)")
     p.add_argument("--juggle-target", default="", help="juggling: commanded bounce height range 'lo,hi' m, redrawn every "
                    "1-3 bounces (adds the height command input); empty = off")
+    p.add_argument("--height-w", type=float, default=2.0, help="juggling: bonus per bounce at the commanded height")
     p.add_argument("--cam-track-w", type=float, default=0.0, help="--cam-policy: reward for keeping the ball near the image centre")
+    p.add_argument("--cam-reversal-w", type=float, default=0.0, help="--cam-policy: penalty for pan/tilt direction reversals "
+                   "(sum over axes of max(0, -rate_t * rate_t-1)); fast moves in one direction are not penalised")
     p.add_argument("--anchor-coef", type=float, default=0.0, help="with --init-from and --juggle-frac: keep the actions in "
                    "balance episodes (mode 0) close to the starting policy (KL weight); 0 = off")
     p.add_argument("--init-from", default="", help="start from this checkpoint's weights (a --cam-policy checkpoint without "
@@ -270,7 +276,7 @@ def main():
             row.update(success_upkick=nan, success_sidekick=nan)
         if getattr(a, "juggle_frac", 0.0) > 0:
             row.update(juggle_s=nan, juggle_bounces=nan, juggle_stalled=nan, success_balance=nan, jitter_between=nan, hit_tilt_deg=nan,
-                       apex_std_cm=nan, target_err_cm=nan)
+                       apex_std_cm=nan, target_err_cm=nan, cam_flips_per_s=nan)
         if recent:
             row.update(ep_return=float(np.mean([e["ret"] for e in recent])), ep_len=float(np.mean([e["length"] for e in recent])),
                        success=float(np.mean([e["success"] for e in recent])))
@@ -286,6 +292,7 @@ def main():
                 row["hit_tilt_deg"] = float(np.nanmean([e.get("tilt", np.nan) for e in js])) if js else float("nan")
                 row["apex_std_cm"] = 100 * float(np.nanmean([e.get("apex_std", np.nan) for e in js])) if js else float("nan")
                 row["target_err_cm"] = 100 * float(np.nanmean([e.get("target_err", np.nan) for e in js])) if js else float("nan")
+                row["cam_flips_per_s"] = float(np.nanmean([e.get("cam_flips", np.nan) for e in js])) if js else float("nan")
                 bs = [e["success"] for e in recent if not e.get("juggle")]
                 row["success_balance"] = float(np.mean(bs)) if bs else float("nan")
             if getattr(a, "kick_z_max", 0.0) > 0:
@@ -307,6 +314,7 @@ def main():
                   + (f" | juggle {row['juggle_s']:.1f} s {row['juggle_bounces']:.1f} bounces stall {row['juggle_stalled']:.2f}"
                      f" jitter {row['jitter_between']:.3f} tilt {row['hit_tilt_deg']:.1f}°"
                      f" apex spread {row['apex_std_cm']:.1f} cm target err {row['target_err_cm']:.1f} cm"
+                     f" cam flips {row['cam_flips_per_s']:.1f}/s"
                      f" balance {row['success_balance']:.2f}" if getattr(a, "juggle_frac", 0.0) > 0 else ""), flush=True)
 
         # 5. checkpoints

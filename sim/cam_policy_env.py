@@ -90,7 +90,7 @@ class CamPolicyEnv:
     def __init__(self, render: bool = False, frames: int = 3, act_hist: int = 3, cam_smooth: float = 0.05,
                  det_noise: DetNoise | None = None, height_info: bool = False, track_gate: float = 0.0,
                  juggle: bool = False, juggle_frac: float = 0.0, juggle_drop: tuple[float, float] = (0.08, 0.15),
-                 cam_track_w: float = 0.0, **env_kw):
+                 cam_track_w: float = 0.0, cam_reversal_w: float = 0.0, **env_kw):
         self.render, self.frames, self.act_hist, self.cam_smooth = render, frames, act_hist, cam_smooth
         self.noise = det_noise if det_noise is not None else DetNoise.load()
         env_kw.setdefault("grip_rot_deg", -90.0)
@@ -104,6 +104,7 @@ class CamPolicyEnv:
             raise ValueError("juggling episodes need juggle=True (the policy must be told the mode)")
         self.height_cmd = env_kw.get("juggle_target") is not None  # the commanded bounce height is an actor input
         self.cam_track_w = cam_track_w  # reward for keeping the ball near the image centre (true projection, training only)
+        self.cam_reversal_w = cam_reversal_w  # penalty for pan/tilt direction reversals (fast in one direction is fine)
         self.obs_dim, self.full_dim = obs_dims(frames, act_hist, height_info, juggle, self.height_cmd)
         self.detector = BallDetector(track=True, hw=EGO_HW, gate=track_gate)
         self.rng = np.random.default_rng()
@@ -160,6 +161,7 @@ class CamPolicyEnv:
         self._acts = np.zeros((self.act_hist, 7))
         self._cam_buf = [np.zeros(2)] * self.env._action_delay
         self._prev_cam = np.zeros(2)
+        self.cam_flips = 0  # camera direction reversals this episode (for evaluation)
         return self._obs(), info
 
     def step(self, action):
@@ -171,6 +173,9 @@ class CamPolicyEnv:
         aim0 = e._aim.copy()
         obs, r, te, tr, info = e.step(a[:5])
         r -= self.cam_smooth * float(np.sum((a[5:7] - self._prev_cam) ** 2))
+        flips = np.maximum(0.0, -a[5:7] * self._prev_cam)  # > 0 only when a pan/tilt rate changes sign
+        r -= self.cam_reversal_w * float(np.sum(flips))
+        self.cam_flips += int(np.sum((a[5:7] * self._prev_cam < 0) & (np.abs(a[5:7]) > 0.05) & (np.abs(self._prev_cam) > 0.05)))
         if self.cam_track_w > 0:  # follow the ball: reward it near the image centre (where it really is, not the detection)
             proj = project(e)
             if proj[3]:
@@ -181,4 +186,5 @@ class CamPolicyEnv:
         self._aims = np.roll(self._aims, 1, axis=0); self._aims[0] = e.cam_aim()
         self._acts = np.roll(self._acts, 1, axis=0); self._acts[0] = a
         info["det"] = det
+        info["cam_flips_per_s"] = self.cam_flips / max(e.t / 30, 1e-6)
         return self._obs(), float(r), te, tr, info

@@ -69,7 +69,7 @@ def _episode(job):
                     tilt=info.get("hit_tilt_deg", float("nan")), lateral=info.get("hit_lateral", float("nan")),
                     jitter=info.get("jitter_between", float("nan")), offset=info.get("apex_offset", float("nan")),
                     apex_std=info.get("apex_std", float("nan")), target_err=info.get("target_err", float("nan")),
-                    cam_off=float(np.mean(off)) if off else float("nan"))
+                    cam_off=float(np.mean(off)) if off else float("nan"), flips=info.get("cam_flips_per_s", float("nan")))
     return dict(lat=lat, success=bool(info["is_success"]), length=t + 1, dist_mm=float(info["dist"] * 1000), seen=float(np.mean(seen)),
                 off=float(np.mean(off)) if off else 1.0, cam=float(np.mean(cam_speed)))
 
@@ -104,7 +104,7 @@ def main():
     if a.juggle:
         print(f"{'latency':>8} {'juggled to the end':>19} {'mean s':>7} {'median s':>9} {'bounces':>8} {'stalls':>7} {'drops':>6} {'apex cm':>8}"
               f" {'hit tilt':>9} {'hit side m/s':>13} {'jitter between':>15} {'off-centre cm':>14} {'apex spread cm':>15}"
-              f" {'target err cm':>14} {'ball in image':>14}")
+              f" {'target err cm':>14} {'ball in image':>14} {'cam flips/s':>12}")
         for lat in lats + ([None] if len(lats) > 1 else []):
             rs = [r for r in res if lat is None or r["lat"] == lat]
             js = np.array([r["juggle_s"] for r in rs])
@@ -115,7 +115,7 @@ def main():
                   f" {np.nanmean([r['tilt'] for r in rs]):8.1f}° {np.nanmean([r['lateral'] for r in rs]):13.3f}"
                   f" {np.nanmean([r['jitter'] for r in rs]):15.3f} {100 * np.nanmean([r['offset'] for r in rs]):14.1f}"
                   f" {100 * np.nanmean([r['apex_std'] for r in rs]):15.1f} {100 * np.nanmean([r['target_err'] for r in rs]):14.1f}"
-                  f" {np.nanmean([r['cam_off'] for r in rs]):14.2f}")
+                  f" {np.nanmean([r['cam_off'] for r in rs]):14.2f} {np.nanmean([r['flips'] for r in rs]):12.1f}")
         return
     print(f"{'latency':>8} {'success':>9} {'len':>5} {'final dist':>11}  {'ball seen':>9} {'|offset|':>9} {'cam |a|':>8}")
     for lat in lats + ([None] if len(lats) > 1 else []):
